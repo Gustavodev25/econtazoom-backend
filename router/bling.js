@@ -3,7 +3,7 @@ const axios = require('axios');
 const qs = require('querystring');
 const router = express.Router();
 const db = require('../firebase').db;
-const admin = require('firebase-admin');
+const admin = require('../firebase').admin;
 
 const BLING_CLIENT_ID = process.env.BLING_CLIENT_ID || '57f339b6be5fdc0d986c1170b709b8d82ece3a76';
 const BLING_CLIENT_SECRET = process.env.BLING_CLIENT_SECRET || '5f59f5f4610f20bfd74984f151bcca343cb1375d68cc27216c4b2bc8a97d';
@@ -11,7 +11,6 @@ const BLING_CLIENT_SECRET = process.env.BLING_CLIENT_SECRET || '5f59f5f4610f20bf
 function getNgrokUrl(req) {
   return req.app.locals.ngrokUrl;
 }
-
 router.get('/auth', (req, res) => {
   const { uid } = req.query;
   if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
