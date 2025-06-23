@@ -16,6 +16,7 @@ const allowedOrigins = [
   'http://localhost:3000',
   'https://econtazoom.vercel.app',
   'https://econtazoom-backend.onrender.com',
+  'https://econtazoom.com.br', // Adicionado domínio de produção
 ];
 app.use(cors({
   origin: function(origin, callback) {
