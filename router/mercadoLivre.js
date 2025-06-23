@@ -20,13 +20,27 @@ function generatePKCE() {
   return { codeVerifier, codeChallenge };
 }
 
+function getRedirectUri() {
+  if (process.env.NODE_ENV === 'production' || !NGROK.url) {
+    return 'https://econtazoom-backend.onrender.com/ml/callback';
+  }
+  return `${NGROK.url}/ml/callback`;
+}
+
+function getFrontendUrl() {
+  if (process.env.NODE_ENV === 'production') {
+    return 'https://econtazoom.com.br/contas?success=Conta%20conectada%20com%20sucesso';
+  }
+  return 'http://localhost:8080/contas?success=Conta%20conectada%20com%20sucesso';
+}
+
 router.get('/auth', async (req, res) => {
   const { uid } = req.query;
   if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
-  if (!NGROK.url) return res.status(503).json({ error: 'ngrok ainda não inicializado' });
+  const redirectUri = getRedirectUri();
+  if (!redirectUri) return res.status(503).json({ error: 'ngrok ainda não inicializado' });
 
   try {
-    const redirectUri = `${NGROK.url}/ml/callback`;
     const { codeVerifier, codeChallenge } = generatePKCE();
     const state = Buffer.from(JSON.stringify({ uid })).toString('base64');
 
@@ -49,9 +63,7 @@ router.get('/callback', async (req, res) => {
   try {
     const decodedState = JSON.parse(Buffer.from(state, 'base64').toString());
     const uid = decodedState.uid;
-    if (!NGROK.url) throw new Error('ngrok ainda não inicializado');
-
-    const redirectUri = `${NGROK.url}/ml/callback`;
+    const redirectUri = getRedirectUri();
     const codeVerifier = codeVerifiers.get(state); 
     if (!codeVerifier) throw new Error('code_verifier não encontrado para o state fornecido');
 
@@ -84,7 +96,7 @@ router.get('/callback', async (req, res) => {
     const { access_token, refresh_token, user_id } = tokenRes.data;
     console.log('Tokens recebidos:', { user_id, access_token, refresh_token });
 
-    const userRes = await axios.get(`https://api.mercadolibre.com/users/${user_id}`, {
+    const userRes = await axios.get(`https://api.mercadolivre.com/users/${user_id}`, {
       headers: { Authorization: `Bearer ${access_token}` },
     });
 
@@ -104,10 +116,10 @@ router.get('/callback', async (req, res) => {
 
     codeVerifiers.delete(state);
 
-    res.redirect('http://localhost:8080/contas?success=Conta%20conectada%20com%20sucesso');
+    res.redirect(getFrontendUrl());
   } catch (err) {
     console.error('Erro no callback:', err.message);
-    res.redirect(`http://localhost:8080/contas?error=${encodeURIComponent('Erro na conexão com Mercado Livre')}`);
+    res.redirect(getFrontendUrl().replace('success=Conta%20conectada%20com%20sucesso', `error=${encodeURIComponent('Erro na conexão com Mercado Livre')}`));
   }
 });
 
