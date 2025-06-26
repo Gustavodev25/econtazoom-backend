@@ -11,12 +11,19 @@ const codeVerifiers = new Map();
 
 const db = require('../firebase').db;
 
+function base64urlEncode(str) {
+  return str
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
 function generatePKCE() {
-  const codeVerifier = crypto.randomBytes(32).toString('base64url');
-  const codeChallenge = crypto
-    .createHash('sha256')
-    .update(codeVerifier)
-    .digest('base64url');
+  const codeVerifier = crypto.randomBytes(32).toString('base64')
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const codeChallenge = base64urlEncode(
+    crypto.createHash('sha256').update(codeVerifier).digest('base64')
+  );
   return { codeVerifier, codeChallenge };
 }
 

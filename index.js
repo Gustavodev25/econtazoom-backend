@@ -42,6 +42,18 @@ app.get('/api/ngrok-url', (req, res) => {
   res.json({ url: ngrokUrl });
 });
 
+// Endpoint de debug para saber se está usando ngrok/local
+app.get('/api/ngrok-debug', (req, res) => {
+  res.json({
+    ngrokUrl,
+    node_env: process.env.NODE_ENV,
+    usandoNgrok: !!ngrokUrl,
+    mensagem: ngrokUrl
+      ? 'ngrok ativo e backend acessível externamente.'
+      : 'ngrok NÃO está ativo. Backend só acessível localmente.'
+  });
+});
+
 app.get('/', (req, res) => {
   res.send('Backend Express rodando!');
 });
@@ -62,7 +74,7 @@ async function startServer() {
         onLogEvent: data => console.log(`ngrok log: ${data}`)
       });
       app.locals.ngrokUrl = ngrokUrl;
-      require('./router/mercadoLivre').NGROK.url = ngrokUrl;
+      require('./router/mercadoLivre').NGROK.url = ngrokUrl; // <-- Aqui atualiza para as rotas do Mercado Livre
       console.log(`ngrok rodando: ${ngrokUrl}`);
     } else {
       ngrokUrl = null;
