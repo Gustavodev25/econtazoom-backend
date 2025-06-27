@@ -39,12 +39,17 @@ function getFrontendUrl() {
   return 'http://localhost:8080/contas';
 }
 
+router.get('/api/ngrok-url', (req, res) => {
+  const ngrokUrl = req.app.locals.ngrokUrl || 'http://localhost:3001';
+  res.json({ url: ngrokUrl });
+});
+
 router.get('/auth', (req, res) => {
   const { uid } = req.query;
   if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
   const redirectUri = getRedirectUri(req);
   const state = Buffer.from(JSON.stringify({ uid })).toString('base64');
-  const url = `https://www.bling.com.br/Api/v3/oauth/authorize?response_type=code&client_id=${BLING_CLIENT_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}`;
+  const url = `https://www.bling.com.br/Api/v3/oauth/authorize?response_type=code&client_id=${BLING_CLIENT_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}&scope=contascontabeis+vendas`;
   res.redirect(url);
 });
 
@@ -86,6 +91,7 @@ router.get('/callback', async (req, res) => {
         ...userRes.data,
       };
     } catch (e) {
+      console.warn('[bling/callback] Falha ao obter dados do usuário:', e.message);
       blingAccount = {};
     }
 
@@ -105,7 +111,7 @@ router.get('/callback', async (req, res) => {
     console.log('Callback Bling: sucesso, redirecionando para frontend');
     res.redirect(getFrontendUrl() + '?bling=success');
   } catch (err) {
-    console.error('Erro no callback Bling:', err.response?.data || err.message || err);
+    console.error('Erro no callback Bling:', err.response?.data || err.message);
     res.redirect(getFrontendUrl() + `?bling=error&msg=${encodeURIComponent(err.response?.data?.error_description || err.message || 'Erro desconhecido')}`);
   }
 });
@@ -158,10 +164,10 @@ async function refreshToken(bling, uid) {
       },
       { merge: true }
     );
-    console.log('[bling/vendas] Token renovado com sucesso');
+    console.log('[bling/refresh] Token renovado com sucesso');
     return access_token;
   } catch (refreshErr) {
-    console.error('[bling/vendas] Erro ao renovar token:', refreshErr.response?.data || refreshErr.message);
+    console.error('[bling/refresh] Erro ao renovar token:', refreshErr.response?.data || refreshErr.message);
     throw refreshErr;
   }
 }
@@ -219,7 +225,6 @@ router.get('/vendas', async (req, res) => {
           tokenUsado = await refreshToken(bling, uid);
           pedidosLista = await getPedidosLista(tokenUsado);
         } catch (refreshErr) {
-          // NÃO exclua o campo bling aqui!
           return res.status(401).json({ error: 'Token Bling expirado ou inválido. Refaça a conexão.' });
         }
       } else {
@@ -403,7 +408,6 @@ router.get('/vendas', async (req, res) => {
   }
 });
 
-// Nova rota para obter todas as contas contábeis do Bling do usuário
 router.get('/financeiro', async (req, res) => {
   const { uid } = req.query;
   if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
@@ -414,102 +418,115 @@ router.get('/financeiro', async (req, res) => {
     bling = docSnap.data()?.bling;
     if (!bling || !bling.access_token) {
       return res.status(401).json({ 
-        error: 'Conta Bling não conectada. Conecte sua conta Bling para acessar o Financeiro.' 
+        error: 'Conta Bling não conectada. Conecte sua conta Bling para acessar o Financeiro.',
+        action: 'reconnect'
       });
     }
 
-    // Log para debug: token usado
     console.log('[bling/financeiro] Usando access_token:', bling.access_token);
 
-    // Chama o endpoint de contas contábeis do Bling
-    const response = await axios.get('https://www.bling.com.br/Api/v3/contas-contabeis', {
-      headers: {
-        Authorization: `Bearer ${bling.access_token}`,
-      },
-      params: {
-        limite: 100,
-      }
-    });
+    let allAccounts = [];
+    let page = 1;
+    const limit = 100;
 
-    res.json(response.data);
-
-  } catch (err) {
-    // Só tenta renovar token se erro for 401
-    if (err.response?.status === 401 && bling?.refresh_token) {
+    while (true) {
       try {
-        console.warn('[bling/financeiro] 401 recebido, tentando renovar token...');
-        const tokenUsado = await refreshToken(bling, req.query.uid);
-        console.log('[bling/financeiro] Novo access_token após refresh:', tokenUsado);
-        // Tenta novamente com o novo token
-        try {
-          const response = await axios.get('https://www.bling.com.br/Api/v3/contas-contabeis', {
-            headers: {
-              Authorization: `Bearer ${tokenUsado}`,
-            },
-            params: {
-              limite: 100,
+        const response = await axios.get('https://www.bling.com.br/Api/v3/contas-contabeis', {
+          headers: {
+            Authorization: `Bearer ${bling.access_token}`,
+          },
+          params: {
+            limite: limit,
+            pagina: page
+          }
+        });
+
+        if (!response.data || !Array.isArray(response.data.data)) {
+          throw new Error('Resposta inesperada do Bling: data não é um array');
+        }
+
+        allAccounts = allAccounts.concat(response.data.data);
+        
+        if (response.data.data.length < limit) {
+          break;
+        }
+        page++;
+      } catch (err) {
+        if (err.response?.status === 401 && bling?.refresh_token) {
+          console.warn('[bling/financeiro] 401 recebido, tentando renovar token...');
+          try {
+            const tokenUsado = await refreshToken(bling, uid);
+            console.log('[bling/financeiro] Novo access_token após refresh:', tokenUsado);
+            
+            const response = await axios.get('https://www.bling.com.br/Api/v3/contas-contabeis', {
+              headers: {
+                Authorization: `Bearer ${tokenUsado}`,
+              },
+              params: {
+                limite: limit,
+                pagina: page
+              }
+            });
+
+            if (!response.data || !Array.isArray(response.data.data)) {
+              throw new Error('Resposta inesperada do Bling após refresh: data não é um array');
             }
-          });
-          return res.json(response.data);
-        } catch (secondErr) {
-          // Se ainda der 401, NÃO apague o campo bling, apenas informe o erro ao frontend
-          if (secondErr.response?.status === 401) {
+
+            allAccounts = allAccounts.concat(response.data.data);
+            
+            if (response.data.data.length < limit) {
+              break;
+            }
+            page++;
+          } catch (secondErr) {
             console.warn('[bling/financeiro] 401 mesmo após refresh. Não apagando campo bling.');
             return res.status(401).json({
               error: 'Acesso negado pelo Bling mesmo após renovar o token. Verifique permissões da conta Bling ou tente reconectar.',
-              detalhe: secondErr.response?.data || secondErr.message
+              detalhe: secondErr.response?.data || secondErr.message,
+              action: 'reconnect'
             });
           }
-          // Outros erros após refresh
-          return res.status(secondErr.response?.status || 500).json({
-            error: 'Erro ao acessar contas contábeis após renovar token',
-            detalhe: secondErr.response?.data || secondErr.message
-          });
-        }
-      } catch (refreshErr) {
-        let isTokenInvalid = false;
-        if (refreshErr.response?.status === 401) {
-          isTokenInvalid = true;
-        } else if (refreshErr.response?.data?.error === 'invalid_grant') {
-          isTokenInvalid = true;
-        } else if (
-          typeof refreshErr.response?.data?.error_description === 'string' &&
-          (
-            refreshErr.response.data.error_description.toLowerCase().includes('invalid') ||
-            refreshErr.response.data.error_description.toLowerCase().includes('expired')
-          )
-        ) {
-          isTokenInvalid = true;
-        }
-        if (isTokenInvalid) {
-          try {
-            await db.collection('users').doc(req.query.uid).update({ bling: admin.firestore.FieldValue.delete() });
-          } catch (cleanErr) {
-            console.warn('[bling/financeiro] Falha ao limpar campo bling após erro de token:', cleanErr.message);
-          }
-          return res.status(401).json({ error: 'Token Bling expirado ou inválido. Refaça a conexão.' });
         } else {
-          return res.status(500).json({ error: 'Erro ao renovar token Bling', detalhe: refreshErr.response?.data || refreshErr.message });
+          throw err;
         }
       }
     }
-    // Se não for erro 401, retorna o erro real do Bling para o frontend
-    if (err.response?.data) {
-      console.error('[bling/financeiro] Erro da API do Bling:', {
-        status: err.response.status,
-        data: err.response.data,
-        headers: err.response.headers,
-        access_token: bling?.access_token
-      });
-      return res.status(err.response.status || 500).json({
-        error: err.response.data.error || 'Erro do Bling',
-        detalhe: err.response.data,
-        bling_access_token: bling?.access_token
-      });
+
+    return res.json({ data: allAccounts });
+  } catch (err) {
+    if (err.response?.status === 401) {
+      let isTokenInvalid = false;
+      if (err.response?.data?.error === 'invalid_grant' || 
+          (typeof err.response?.data?.error_description === 'string' &&
+           (err.response.data.error_description.toLowerCase().includes('invalid') ||
+            err.response.data.error_description.toLowerCase().includes('expired')))) {
+        isTokenInvalid = true;
+      }
+      if (isTokenInvalid) {
+        try {
+          await db.collection('users').doc(uid).update({ bling: admin.firestore.FieldValue.delete() });
+          console.log('[bling/financeiro] Campo bling removido devido a token inválido');
+        } catch (cleanErr) {
+          console.warn('[bling/financeiro] Falha ao limpar campo bling:', cleanErr.message);
+        }
+        return res.status(401).json({ 
+          error: 'Token Bling expirado ou inválido. Refaça a conexão.',
+          action: 'reconnect'
+        });
+      }
     }
-    // Outros erros
-    console.error('[bling/financeiro] Erro:', err.response?.data || err.message);
-    res.status(500).json({ error: 'Erro ao buscar dados financeiros do Bling', detalhe: err.response?.data || err.message });
+    
+    console.error('[bling/financeiro] Erro da API do Bling:', {
+      status: err.response?.status,
+      data: err.response?.data,
+      headers: err.response?.headers,
+      access_token: bling?.access_token
+    });
+    
+    return res.status(err.response?.status || 500).json({
+      error: err.response?.data?.error || 'Erro ao buscar dados financeiros do Bling',
+      detalhe: err.response?.data || err.message
+    });
   }
 });
 
