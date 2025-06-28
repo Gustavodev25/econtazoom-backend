@@ -9,13 +9,29 @@ const crypto = require('crypto');
 const BLING_CLIENT_ID = process.env.BLING_CLIENT_ID || '57f339b6be5fdc0d986c1170b709b8d82ece3a76';
 const BLING_CLIENT_SECRET = process.env.BLING_CLIENT_SECRET || '5f59f5f4610f20bfd74984f151bcca343cb1375d68cc27216c4b2bc8a97d';
 
-// Mapa de IDs de canais para nomes descritivos
+const BLING_SCOPES = [
+  'contas-contabeis',
+  'financeiro',
+  'contas-pagar',
+  'contas-receber',
+  'borderos',
+  'naturezas-operacao',
+  'formas-pagamento',
+  'categorias-receitas-despesas',
+  'canais-venda',
+  'campos-customizados',
+  'vendas',
+  'movimentacoes-financeiras',
+  'contas-bancarias',
+  'conciliacoes',
+  'boletos',
+].join('+');
+
 const canalVendaMap = {
   '203520103': 'Mercado Livre',
   '204640345': 'Shopee',
 };
 
-// Mapa de status do Bling para textos descritivos
 const statusMap = {
   2: 'Cancelado',
   6: 'Em andamento',
@@ -49,7 +65,8 @@ router.get('/auth', (req, res) => {
   if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
   const redirectUri = getRedirectUri(req);
   const state = Buffer.from(JSON.stringify({ uid })).toString('base64');
-  const url = `https://www.bling.com.br/Api/v3/oauth/authorize?response_type=code&client_id=${BLING_CLIENT_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}&scope=contascontabeis+vendas`;
+  const url = `https://www.bling.com.br/Api/v3/oauth/authorize?response_type=code&client_id=${BLING_CLIENT_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}&scope=${BLING_SCOPES}`;
+  console.log('[bling/auth] Authorization URL:', url);
   res.redirect(url);
 });
 
@@ -168,9 +185,447 @@ async function refreshToken(bling, uid) {
     return access_token;
   } catch (refreshErr) {
     console.error('[bling/refresh] Erro ao renovar token:', refreshErr.response?.data || refreshErr.message);
+    if (refreshErr.response?.data?.error === 'invalid_grant' || refreshErr.response?.data?.error === 'invalid_token') {
+      try {
+        await db.collection('users').doc(uid).update({ bling: admin.firestore.FieldValue.delete() });
+        console.log('[bling/refresh] Campo bling removido devido a refresh token inválido');
+      } catch (cleanErr) {
+        console.warn('[bling/refresh] Falha ao limpar campo bling:', cleanErr.message);
+      }
+      throw new Error('Token Bling expirado ou inválido. Refaça a conexão.');
+    }
     throw refreshErr;
   }
 }
+
+async function blingPagedGet(url, token, params = {}, refreshFn, uid) {
+  let allData = [];
+  let page = params.pagina || 1;
+  const limit = params.limite || 100;
+  let tokenUsado = token;
+  let tentouRefresh = false;
+  while (true) {
+    try {
+      console.log(`[blingPagedGet] Requesting ${url} with page=${page}, limit=${limit}, params=${JSON.stringify(params)}`);
+      const response = await axios.get(url, {
+        headers: { Authorization: `Bearer ${tokenUsado}` },
+        params: { ...params, limite: limit, pagina: page },
+      });
+      if (!response.data || !Array.isArray(response.data.data)) {
+        throw new Error('Resposta inesperada do Bling: data não é um array');
+      }
+      allData = allData.concat(response.data.data);
+      if (response.data.data.length < limit) break;
+      page++;
+    } catch (err) {
+      console.error(`[blingPagedGet] Erro ao acessar ${url}:`, err.response?.data || err.message);
+      if (err.response?.status === 401 && refreshFn && !tentouRefresh) {
+        tentouRefresh = true;
+        try {
+          tokenUsado = await refreshFn();
+          continue;
+        } catch (refreshErr) {
+          if (refreshErr.response?.data?.error === 'invalid_grant' || refreshErr.response?.data?.error === 'invalid_token') {
+            await db.collection('users').doc(uid).update({ bling: admin.firestore.FieldValue.delete() });
+            throw new Error('Token Bling expirado ou inválido. Refaça a conexão.');
+          } else if (refreshErr.response?.data?.error === 'insufficient_scope') {
+            throw new Error('Permissões insuficientes no Bling. Reconecte sua conta com as permissões corretas.');
+          }
+          throw refreshErr;
+        }
+      } else if (err.response?.status === 404 && err.response?.data?.error?.type === 'RESOURCE_NOT_FOUND') {
+        throw new Error('Recurso não encontrado no Bling. Verifique se o recurso está habilitado na sua conta Bling.');
+      } else if (err.response?.data?.error === 'insufficient_scope') {
+        throw new Error('Permissões insuficientes no Bling. Reconecte sua conta com as permissões corretas.');
+      }
+      throw err;
+    }
+  }
+  return allData;
+}
+
+// Utility function to map detailed account data
+function mapearConta(conta, tipo) {
+  return {
+    id: conta.id || '-',
+    fornecedor: tipo === 'pagar' ? (conta.fornecedor?.nome || '-') : null,
+    cliente: tipo === 'receber' ? (conta.cliente?.nome || '-') : null,
+    valor: Number(conta.valor || 0).toFixed(2),
+    valorOriginal: Number(conta.valorOriginal || conta.valor || 0).toFixed(2),
+    valorPago: Number(conta.valorPago || 0).toFixed(2),
+    dataVencimento: conta.dataVencimento || '-',
+    dataEmissao: conta.dataEmissao || '-',
+    dataBaixa: conta.dataBaixa || '-',
+    situacao: conta.situacao?.descricao || '-',
+    categoria: conta.categoria?.descricao || '-',
+    formaPagamento: conta.formaPagamento?.descricao || '-',
+    centroCusto: conta.centroCusto?.descricao || '-',
+    usuarioCriacao: conta.usuarioCriacao?.nome || '-',
+    usuarioAlteracao: conta.usuarioAlteracao?.nome || '-',
+    dataUltimaAlteracao: conta.dataUltimaAlteracao || '-',
+    numeroDocumento: conta.numeroDocumento || '-',
+    juros: Number(conta.juros || 0).toFixed(2),
+    multa: Number(conta.multa || 0).toFixed(2),
+    desconto: Number(conta.desconto || 0).toFixed(2),
+    anexos: Array.isArray(conta.anexos) ? conta.anexos.map(a => ({ nome: a.nome, url: a.url })) : [],
+    historicoMovimentacoes: Array.isArray(conta.historicoMovimentacoes) ? conta.historicoMovimentacoes.map(h => ({
+      data: h.data || '-',
+      tipo: h.tipo || '-',
+      valor: Number(h.valor || 0).toFixed(2),
+      observacao: h.observacao || '-',
+    })) : [],
+    raw: conta,
+  };
+}
+
+router.get('/financeiro', async (req, res) => {
+  const { uid } = req.query;
+  if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
+
+  try {
+    const docSnap = await db.collection('users').doc(uid).get();
+    const bling = docSnap.data()?.bling;
+    if (!bling?.access_token) {
+      return res.status(401).json({
+        error: 'Conta Bling não conectada. Conecte sua conta Bling para acessar o Financeiro.',
+        action: 'reconnect',
+      });
+    }
+
+    const refreshFn = async () => await refreshToken(bling, uid);
+    const data = await blingPagedGet(
+      'https://www.bling.com.br/Api/v3/contas-contabeis',
+      bling.access_token,
+      {},
+      refreshFn,
+      uid
+    );
+    const mappedData = data.map(conta => ({
+      id: conta.id || '-',
+      nome: conta.nome || '-',
+      tipo: conta.tipo || '-',
+      saldoInicial: conta.saldoInicial || 0,
+      saldoAtual: conta.saldoAtual || 0,
+      moeda: conta.moeda || 'BRL',
+      ativo: conta.ativo !== undefined ? conta.ativo : true,
+      dataCriacao: conta.dataCriacao || conta.data || '-',
+      observacoes: conta.observacoes || '',
+      raw: conta,
+    }));
+    return res.json({ data: mappedData });
+  } catch (err) {
+    if (
+      err.message?.includes('Token Bling expirado ou inválido') ||
+      err.message?.toLowerCase().includes('invalid_token') ||
+      err.message?.toLowerCase().includes('invalid_grant')
+    ) {
+      return res.status(401).json({
+        error: 'Token Bling expirado ou inválido. Refaça a conexão.',
+        action: 'reconnect',
+        detalhe: err.response?.data || err.message,
+      });
+    }
+    console.error('[bling/financeiro] Erro:', err.response?.data || err.message);
+    return res.status(err.response?.status || 500).json({
+      error: err.message || 'Erro ao buscar dados financeiros do Bling',
+      action: err.message.includes('Refaça a conexão') || err.message.includes('Permissões insuficientes') ? 'reconnect' : undefined,
+      detalhe: err.response?.data || err.message,
+    });
+  }
+});
+
+router.get('/borderos', async (req, res) => {
+  const { uid } = req.query;
+  if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
+  try {
+    const docSnap = await db.collection('users').doc(uid).get();
+    const bling = docSnap.data()?.bling;
+    if (!bling?.access_token) return res.status(401).json({ error: 'Conta Bling não conectada', action: 'reconnect' });
+    const refreshFn = async () => await refreshToken(bling, uid);
+    const data = await blingPagedGet('https://www.bling.com.br/Api/v3/borderos', bling.access_token, {}, refreshFn, uid);
+    res.json({ data });
+  } catch (err) {
+    console.error('[bling/borderos] Erro:', err.response?.data || err.message);
+    return res.status(err.response?.status || 500).json({
+      error: err.message || 'Erro ao buscar borderôs. Verifique se o recurso Borderôs está habilitado na sua conta Bling.',
+      action: err.message.includes('Refaça a conexão') || err.message.includes('Permissões insuficientes') ? 'reconnect' : undefined,
+      detalhe: err.response?.data || err.message,
+    });
+  }
+});
+
+router.get('/naturezas-operacoes', async (req, res) => {
+  const { uid } = req.query;
+  if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
+  try {
+    const docSnap = await db.collection('users').doc(uid).get();
+    const bling = docSnap.data()?.bling;
+    if (!bling?.access_token) return res.status(401).json({ error: 'Conta Bling não conectada', action: 'reconnect' });
+    const refreshFn = async () => await refreshToken(bling, uid);
+    const data = await blingPagedGet('https://www.bling.com.br/Api/v3/naturezas-operacao', bling.access_token, {}, refreshFn, uid);
+    res.json({ data });
+  } catch (err) {
+    console.error('[bling/naturezas-operacoes] Erro:', err.response?.data || err.message);
+    return res.status(err.response?.status || 500).json({
+      error: err.message || 'Erro ao buscar naturezas de operações',
+      action: err.message.includes('Refaça a conexão') || err.message.includes('Permissões insuficientes') ? 'reconnect' : undefined,
+      detalhe: err.response?.data || err.message,
+    });
+  }
+});
+
+router.get('/contas-pagar', async (req, res) => {
+  const { uid, dataInicio, dataFim, situacao } = req.query;
+  if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
+  try {
+    const docSnap = await db.collection('users').doc(uid).get();
+    const bling = docSnap.data()?.bling;
+    if (!bling?.access_token) return res.status(401).json({ error: 'Conta Bling não conectada', action: 'reconnect' });
+    const refreshFn = async () => await refreshToken(bling, uid);
+    const params = { dataInicio, dataFim, situacao };
+    const data = await blingPagedGet('https://www.bling.com.br/Api/v3/contas-pagar', bling.access_token, params, refreshFn, uid);
+    const mappedData = data.map(conta => mapearConta(conta, 'pagar'));
+    res.json({ data: mappedData });
+  } catch (err) {
+    console.error('[bling/contas-pagar] Erro:', err.response?.data || err.message);
+    return res.status(err.response?.status || 500).json({
+      error: err.message || 'Erro ao buscar contas a pagar',
+      action: err.message.includes('Refaça a conexão') || err.message.includes('Permissões insuficientes') ? 'reconnect' : undefined,
+      detalhe: err.response?.data || err.message,
+    });
+  }
+});
+
+router.get('/contas-receber', async (req, res) => {
+  const { uid, dataInicio, dataFim, situacao } = req.query;
+  if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
+  try {
+    const docSnap = await db.collection('users').doc(uid).get();
+    const bling = docSnap.data()?.bling;
+    if (!bling?.access_token) return res.status(401).json({ error: 'Conta Bling não conectada', action: 'reconnect' });
+    const refreshFn = async () => await refreshToken(bling, uid);
+    const params = { dataInicio, dataFim, situacao };
+    const data = await blingPagedGet('https://www.bling.com.br/Api/v3/contas-receber', bling.access_token, params, refreshFn, uid);
+    const mappedData = data.map(conta => mapearConta(conta, 'receber'));
+    res.json({ data: mappedData });
+  } catch (err) {
+    console.error('[bling/contas-receber] Erro:', err.response?.data || err.message);
+    return res.status(err.response?.status || 500).json({
+      error: err.message || 'Erro ao buscar contas a receber',
+      action: err.message.includes('Refaça a conexão') || err.message.includes('Permissões insuficientes') ? 'reconnect' : undefined,
+      detalhe: err.response?.data || err.message,
+    });
+  }
+});
+
+router.get('/formas-pagamento', async (req, res) => {
+  const { uid } = req.query;
+  if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
+  try {
+    const docSnap = await db.collection('users').doc(uid).get();
+    const bling = docSnap.data()?.bling;
+    if (!bling?.access_token) return res.status(401).json({ error: 'Conta Bling não conectada', action: 'reconnect' });
+    const refreshFn = async () => await refreshToken(bling, uid);
+    const data = await blingPagedGet('https://www.bling.com.br/Api/v3/formas-pagamento', bling.access_token, {}, refreshFn, uid);
+    res.json({ data });
+  } catch (err) {
+    console.error('[bling/formas-pagamento] Erro:', err.response?.data || err.message);
+    return res.status(err.response?.status || 500).json({
+      error: err.message || 'Erro ao buscar formas de pagamento',
+      action: err.message.includes('Refaça a conexão') || err.message.includes('Permissões insuficientes') ? 'reconnect' : undefined,
+      detalhe: err.response?.data || err.message,
+    });
+  }
+});
+
+router.get('/categorias-receitas-despesas', async (req, res) => {
+  const { uid } = req.query;
+  if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
+  try {
+    const docSnap = await db.collection('users').doc(uid).get();
+    const bling = docSnap.data()?.bling;
+    if (!bling?.access_token) return res.status(401).json({ error: 'Conta Bling não conectada', action: 'reconnect' });
+    const refreshFn = async () => await refreshToken(bling, uid);
+    const data = await blingPagedGet('https://www.bling.com.br/Api/v3/categorias-receitas-despesas', bling.access_token, {}, refreshFn, uid);
+    res.json({ data });
+  } catch (err) {
+    console.error('[bling/categorias-receitas-despesas] Erro:', err.response?.data || err.message);
+    return res.status(err.response?.status || 500).json({
+      error: err.message || 'Erro ao buscar categorias de receitas/despesas',
+      action: err.message.includes('Refaça a conexão') || err.message.includes('Permissões insuficientes') ? 'reconnect' : undefined,
+      detalhe: err.response?.data || err.message,
+    });
+  }
+});
+
+router.get('/canais-venda', async (req, res) => {
+  const { uid } = req.query;
+  if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
+  try {
+    const docSnap = await db.collection('users').doc(uid).get();
+    const bling = docSnap.data()?.bling;
+    if (!bling?.access_token) return res.status(401).json({ error: 'Conta Bling não conectada', action: 'reconnect' });
+    const refreshFn = async () => await refreshToken(bling, uid);
+    const data = await blingPagedGet('https://www.bling.com.br/Api/v3/canais-venda', bling.access_token, {}, refreshFn, uid);
+    res.json({ data });
+  } catch (err) {
+    console.error('[bling/canais-venda] Erro:', err.response?.data || err.message);
+    return res.status(err.response?.status || 500).json({
+      error: err.message || 'Erro ao buscar canais de venda',
+      action: err.message.includes('Refaça a conexão') || err.message.includes('Permissões insuficientes') ? 'reconnect' : undefined,
+      detalhe: err.response?.data || err.message,
+    });
+  }
+});
+
+router.get('/campos-customizados', async (req, res) => {
+  const { uid } = req.query;
+  if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
+  try {
+    const docSnap = await db.collection('users').doc(uid).get();
+    const bling = docSnap.data()?.bling;
+    if (!bling?.access_token) return res.status(401).json({ error: 'Conta Bling não conectada', action: 'reconnect' });
+    const refreshFn = async () => await refreshToken(bling, uid);
+    const data = await blingPagedGet('https://www.bling.com.br/Api/v3/campos-customizados', bling.access_token, {}, refreshFn, uid);
+    res.json({ data });
+  } catch (err) {
+    console.error('[bling/campos-customizados] Erro:', err.response?.data || err.message);
+    return res.status(err.response?.status || 500).json({
+      error: err.message || 'Erro ao buscar campos customizados',
+      action: err.message.includes('Refaça a conexão') || err.message.includes('Permissões insuficientes') ? 'reconnect' : undefined,
+      detalhe: err.response?.data || err.message,
+    });
+  }
+});
+
+router.get('/movimentacoes-financeiras', async (req, res) => {
+  const { uid, dataInicio, dataFim } = req.query;
+  if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
+  try {
+    const docSnap = await db.collection('users').doc(uid).get();
+    const bling = docSnap.data()?.bling;
+    if (!bling?.access_token) return res.status(401).json({ error: 'Conta Bling não conectada', action: 'reconnect' });
+    const refreshFn = async () => await refreshToken(bling, uid);
+    const params = { dataInicio, dataFim };
+    const data = await blingPagedGet('https://www.bling.com.br/Api/v3/movimentacoes-financeiras', bling.access_token, params, refreshFn, uid);
+    const mappedData = data.map(mov => ({
+      id: mov.id || '-',
+      tipo: mov.tipo || '-',
+      valor: Number(mov.valor || 0).toFixed(2),
+      dataEfetivacao: mov.dataEfetivacao || '-',
+      origem: mov.origem || 'manual',
+      contaOrigem: mov.contaOrigem?.nome || '-',
+      contaDestino: mov.contaDestino?.nome || '-',
+      categoria: mov.categoria?.descricao || '-',
+      observacao: mov.observacao || '-',
+      raw: mov,
+    }));
+    res.json({ data: mappedData });
+  } catch (err) {
+    console.error('[bling/movimentacoes-financeiras] Erro:', err.response?.data || err.message);
+    return res.status(err.response?.status || 500).json({
+      error: err.message || 'Erro ao buscar movimentações financeiras',
+      action: err.message.includes('Refaça a conexão') || err.message.includes('Permissões insuficientes') ? 'reconnect' : undefined,
+      detalhe: err.response?.data || err.message,
+    });
+  }
+});
+
+router.get('/contas-bancarias', async (req, res) => {
+  const { uid } = req.query;
+  if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
+  try {
+    const docSnap = await db.collection('users').doc(uid).get();
+    const bling = docSnap.data()?.bling;
+    if (!bling?.access_token) return res.status(401).json({ error: 'Conta Bling não conectada', action: 'reconnect' });
+    const refreshFn = async () => await refreshToken(bling, uid);
+    const data = await blingPagedGet('https://www.bling.com.br/Api/v3/contas-bancarias', bling.access_token, {}, refreshFn, uid);
+    const mappedData = data.map(conta => ({
+      id: conta.id || '-',
+      nome: conta.nome || '-',
+      tipo: conta.tipo || '-',
+      saldo: Number(conta.saldo || 0).toFixed(2),
+      banco: conta.banco || '-',
+      agencia: conta.agencia || '-',
+      numeroConta: conta.numeroConta || '-',
+      ativo: conta.ativo !== undefined ? conta.ativo : true,
+      dataCriacao: conta.dataCriacao || '-',
+      raw: conta,
+    }));
+    res.json({ data: mappedData });
+  } catch (err) {
+    console.error('[bling/contas-bancarias] Erro:', err.response?.data || err.message);
+    return res.status(err.response?.status || 500).json({
+      error: err.message || 'Erro ao buscar contas bancárias',
+      action: err.message.includes('Refaça a conexão') || err.message.includes('Permissões insuficientes') ? 'reconnect' : undefined,
+      detalhe: err.response?.data || err.message,
+    });
+  }
+});
+
+router.get('/conciliacoes', async (req, res) => {
+  const { uid, dataInicio, dataFim } = req.query;
+  if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
+  try {
+    const docSnap = await db.collection('users').doc(uid).get();
+    const bling = docSnap.data()?.bling;
+    if (!bling?.access_token) return res.status(401).json({ error: 'Conta Bling não conectada', action: 'reconnect' });
+    const refreshFn = async () => await refreshToken(bling, uid);
+    const params = { dataInicio, dataFim };
+    const data = await blingPagedGet('https://www.bling.com.br/Api/v3/conciliacoes', bling.access_token, params, refreshFn, uid);
+    const mappedData = data.map(conc => ({
+      id: conc.id || '-',
+      contaBancaria: conc.contaBancaria?.nome || '-',
+      dataConciliacao: conc.dataConciliacao || '-',
+      status: conc.status || '-',
+      valorConciliado: Number(conc.valorConciliado || 0).toFixed(2),
+      movimentacao: conc.movimentacao?.id || '-',
+      observacao: conc.observacao || '-',
+      raw: conc,
+    }));
+    res.json({ data: mappedData });
+  } catch (err) {
+    console.error('[bling/conciliacoes] Erro:', err.response?.data || err.message);
+    return res.status(err.response?.status || 500).json({
+      error: err.message || 'Erro ao buscar conciliações bancárias',
+      action: err.message.includes('Refaça a conexão') || err.message.includes('Permissões insuficientes') ? 'reconnect' : undefined,
+      detalhe: err.response?.data || err.message,
+    });
+  }
+});
+
+router.get('/boletos', async (req, res) => {
+  const { uid, dataInicio, dataFim, situacao } = req.query;
+  if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
+  try {
+    const docSnap = await db.collection('users').doc(uid).get();
+    const bling = docSnap.data()?.bling;
+    if (!bling?.access_token) return res.status(401).json({ error: 'Conta Bling não conectada', action: 'reconnect' });
+    const refreshFn = async () => await refreshToken(bling, uid);
+    const params = { dataInicio, dataFim, situacao };
+    const data = await blingPagedGet('https://www.bling.com.br/Api/v3/boletos', bling.access_token, params, refreshFn, uid);
+    const mappedData = data.map(boleto => ({
+      id: boleto.id || '-',
+      cliente: boleto.cliente?.nome || '-',
+      valor: Number(boleto.valor || 0).toFixed(2),
+      dataEmissao: boleto.dataEmissao || '-',
+      dataVencimento: boleto.dataVencimento || '-',
+      status: boleto.status || '-',
+      linhaDigitavel: boleto.linhaDigitavel || '-',
+      urlPDF: boleto.urlPDF || '-',
+      numeroDocumento: boleto.numeroDocumento || '-',
+      raw: boleto,
+    }));
+    res.json({ data: mappedData });
+  } catch (err) {
+    console.error('[bling/boletos] Erro:', err.response?.data || err.message);
+    return res.status(err.response?.status || 500).json({
+      error: err.message || 'Erro ao buscar boletos emitidos',
+      action: err.message.includes('Refaça a conexão') || err.message.includes('Permissões insuficientes') ? 'reconnect' : undefined,
+      detalhe: err.response?.data || err.message,
+    });
+  }
+});
 
 router.get('/vendas', async (req, res) => {
   const { uid } = req.query;
@@ -179,9 +634,7 @@ router.get('/vendas', async (req, res) => {
   async function getPedidosLista(token) {
     try {
       const pedidosRes = await axios.get('https://www.bling.com.br/Api/v3/pedidos/vendas', {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
+        headers: { Authorization: `Bearer ${token}` },
         params: { limite: 30 },
       });
       console.log('[bling/vendas] Resposta bruta da lista do Bling:', JSON.stringify(pedidosRes.data, null, 2));
@@ -195,9 +648,7 @@ router.get('/vendas', async (req, res) => {
   async function getPedidoDetalhe(id, token) {
     try {
       const pedidoRes = await axios.get(`https://www.bling.com.br/Api/v3/pedidos/vendas/${id}`, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
+        headers: { Authorization: `Bearer ${token}` },
       });
       console.log(`[bling/vendas] Detalhes do pedido ${id}:`, JSON.stringify(pedidoRes.data, null, 2));
       return pedidoRes.data.data;
@@ -211,22 +662,42 @@ router.get('/vendas', async (req, res) => {
     const docSnap = await db.collection('users').doc(uid).get();
     const bling = docSnap.data()?.bling;
     if (!bling || !bling.access_token) {
-      return res.status(401).json({ error: 'Conta Bling não conectada' });
+      return res.status(401).json({ error: 'Conta Bling não conectada', action: 'reconnect' });
     }
 
     let tokenUsado = bling.access_token;
     let pedidosLista;
+    const refreshFn = async () => await refreshToken(bling, uid);
 
     try {
       pedidosLista = await getPedidosLista(tokenUsado);
     } catch (err) {
       if (err.response?.status === 401 && bling.refresh_token) {
         try {
-          tokenUsado = await refreshToken(bling, uid);
+          tokenUsado = await refreshFn();
           pedidosLista = await getPedidosLista(tokenUsado);
         } catch (refreshErr) {
-          return res.status(401).json({ error: 'Token Bling expirado ou inválido. Refaça a conexão.' });
+          if (refreshErr.response?.data?.error === 'insufficient_scope') {
+            return res.status(401).json({
+              error: 'Permissões insuficientes no Bling. Reconecte sua conta com as permissões corretas.',
+              action: 'reconnect',
+            });
+          }
+          return res.status(401).json({
+            error: refreshErr.message || 'Token Bling expirado ou inválido. Refaça a conexão.',
+            action: 'reconnect',
+          });
         }
+      } else if (err.response?.data?.error === 'insufficient_scope') {
+        return res.status(401).json({
+          error: 'Permissões insuficientes no Bling. Reconecte sua conta com as permissões corretas.',
+          action: 'reconnect',
+        });
+      } else if (err.response?.status === 404 && err.response?.data?.error?.type === 'RESOURCE_NOT_FOUND') {
+        return res.status(404).json({
+          error: 'Recurso não encontrado no Bling. Verifique se o recurso Vendas está habilitado na sua conta Bling.',
+          detalhe: err.response?.data || err.message,
+        });
       } else {
         throw err;
       }
@@ -241,15 +712,29 @@ router.get('/vendas', async (req, res) => {
             const detalhes = await getPedidoDetalhe(idVenda, tokenUsado);
             pedidos.push(mapearVenda(detalhes || pedido));
           } catch (err) {
-            if (err.response?.data?.error?.type === 'invalid_token' && bling.refresh_token) {
+            if (err.response?.data?.error === 'invalid_token' && bling.refresh_token) {
               try {
-                tokenUsado = await refreshToken(bling, uid);
+                tokenUsado = await refreshFn();
                 const detalhes = await getPedidoDetalhe(idVenda, tokenUsado);
                 pedidos.push(mapearVenda(detalhes || pedido));
               } catch (refreshErr) {
+                if (refreshErr.response?.data?.error === 'insufficient_scope') {
+                  return res.status(401).json({
+                    error: 'Permissões insuficientes no Bling. Reconecte sua conta com as permissões corretas.',
+                    action: 'reconnect',
+                  });
+                }
                 console.warn(`[bling/vendas] Falha ao renovar token para pedido ${idVenda}, usando dados da lista:`, pedido);
                 pedidos.push(mapearVenda(pedido));
               }
+            } else if (err.response?.data?.error === 'insufficient_scope') {
+              return res.status(401).json({
+                error: 'Permissões insuficientes no Bling. Reconecte sua conta com as permissões corretas.',
+                action: 'reconnect',
+              });
+            } else if (err.response?.status === 404 && err.response?.data?.error?.type === 'RESOURCE_NOT_FOUND') {
+              console.warn(`[bling/vendas] Recurso não encontrado para pedido ${idVenda}, usando dados da lista:`, pedido);
+              pedidos.push(mapearVenda(pedido));
             } else {
               console.warn(`[bling/vendas] Usando dados da lista para pedido ${idVenda} devido a erro:`, err.response?.data || err.message);
               pedidos.push(mapearVenda(pedido));
@@ -392,140 +877,11 @@ router.get('/vendas', async (req, res) => {
 
     res.json(pedidos);
   } catch (err) {
-    if (err.response && err.response.data && err.response.data.error && err.response.data.error.type === 'error_not_found') {
-      console.warn('[bling/vendas] Bling retornou error_not_found, tratando como sem vendas.');
-      return res.json({
-        motivo: 'sem-vendas',
-        msg: 'Nenhuma venda encontrada no Bling.',
-        debug: err.response.data,
-      });
-    }
-    console.error('[bling/vendas] Erro geral:', err.response?.data || err.message);
-    res.status(500).json({
-      error: 'Erro ao buscar dados do Bling',
-      detalhe: err.response?.data || err.message,
-    });
-  }
-});
-
-router.get('/financeiro', async (req, res) => {
-  const { uid } = req.query;
-  if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
-
-  let bling;
-  try {
-    const docSnap = await db.collection('users').doc(uid).get();
-    bling = docSnap.data()?.bling;
-    if (!bling || !bling.access_token) {
-      return res.status(401).json({ 
-        error: 'Conta Bling não conectada. Conecte sua conta Bling para acessar o Financeiro.',
-        action: 'reconnect'
-      });
-    }
-
-    console.log('[bling/financeiro] Usando access_token:', bling.access_token);
-
-    let allAccounts = [];
-    let page = 1;
-    const limit = 100;
-
-    while (true) {
-      try {
-        const response = await axios.get('https://www.bling.com.br/Api/v3/contas-contabeis', {
-          headers: {
-            Authorization: `Bearer ${bling.access_token}`,
-          },
-          params: {
-            limite: limit,
-            pagina: page
-          }
-        });
-
-        if (!response.data || !Array.isArray(response.data.data)) {
-          throw new Error('Resposta inesperada do Bling: data não é um array');
-        }
-
-        allAccounts = allAccounts.concat(response.data.data);
-        
-        if (response.data.data.length < limit) {
-          break;
-        }
-        page++;
-      } catch (err) {
-        if (err.response?.status === 401 && bling?.refresh_token) {
-          console.warn('[bling/financeiro] 401 recebido, tentando renovar token...');
-          try {
-            const tokenUsado = await refreshToken(bling, uid);
-            console.log('[bling/financeiro] Novo access_token após refresh:', tokenUsado);
-            
-            const response = await axios.get('https://www.bling.com.br/Api/v3/contas-contabeis', {
-              headers: {
-                Authorization: `Bearer ${tokenUsado}`,
-              },
-              params: {
-                limite: limit,
-                pagina: page
-              }
-            });
-
-            if (!response.data || !Array.isArray(response.data.data)) {
-              throw new Error('Resposta inesperada do Bling após refresh: data não é um array');
-            }
-
-            allAccounts = allAccounts.concat(response.data.data);
-            
-            if (response.data.data.length < limit) {
-              break;
-            }
-            page++;
-          } catch (secondErr) {
-            console.warn('[bling/financeiro] 401 mesmo após refresh. Não apagando campo bling.');
-            return res.status(401).json({
-              error: 'Acesso negado pelo Bling mesmo após renovar o token. Verifique permissões da conta Bling ou tente reconectar.',
-              detalhe: secondErr.response?.data || secondErr.message,
-              action: 'reconnect'
-            });
-          }
-        } else {
-          throw err;
-        }
-      }
-    }
-
-    return res.json({ data: allAccounts });
-  } catch (err) {
-    if (err.response?.status === 401) {
-      let isTokenInvalid = false;
-      if (err.response?.data?.error === 'invalid_grant' || 
-          (typeof err.response?.data?.error_description === 'string' &&
-           (err.response.data.error_description.toLowerCase().includes('invalid') ||
-            err.response.data.error_description.toLowerCase().includes('expired')))) {
-        isTokenInvalid = true;
-      }
-      if (isTokenInvalid) {
-        try {
-          await db.collection('users').doc(uid).update({ bling: admin.firestore.FieldValue.delete() });
-          console.log('[bling/financeiro] Campo bling removido devido a token inválido');
-        } catch (cleanErr) {
-          console.warn('[bling/financeiro] Falha ao limpar campo bling:', cleanErr.message);
-        }
-        return res.status(401).json({ 
-          error: 'Token Bling expirado ou inválido. Refaça a conexão.',
-          action: 'reconnect'
-        });
-      }
-    }
-    
-    console.error('[bling/financeiro] Erro da API do Bling:', {
-      status: err.response?.status,
-      data: err.response?.data,
-      headers: err.response?.headers,
-      access_token: bling?.access_token
-    });
-    
+    console.error('[bling/vendas] Erro:', err.response?.data || err.message);
     return res.status(err.response?.status || 500).json({
-      error: err.response?.data?.error || 'Erro ao buscar dados financeiros do Bling',
-      detalhe: err.response?.data || err.message
+      error: err.message || 'Erro ao buscar dados do Bling',
+      action: err.message.includes('Refaça a conexão') || err.message.includes('Permissões insuficientes') ? 'reconnect' : undefined,
+      detalhe: err.response?.data || err.message,
     });
   }
 });

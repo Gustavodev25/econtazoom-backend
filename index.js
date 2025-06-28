@@ -35,6 +35,12 @@ app.use(express.json());
 app.use('/ml', mercadoLivreRouter);
 app.use('/bling', blingRouter);
 
+// Força o log de todas as requisições recebidas e erros não tratados
+app.use((req, res, next) => {
+  console.log(`[Express] ${req.method} ${req.url} - Body:`, req.body, '- Query:', req.query);
+  next();
+});
+
 app.get('/api/ngrok-url', (req, res) => {
   if (!ngrokUrl) {
     return res.status(503).json({ error: 'ngrok ainda não inicializado' });
@@ -64,6 +70,11 @@ async function startServer() {
       console.log(`Servidor Express rodando na porta ${PORT}`);
     });
 
+    // Loga variáveis de ambiente importantes para debug
+    console.log('[DEBUG] NODE_ENV:', process.env.NODE_ENV);
+    console.log('[DEBUG] NGROK_AUTHTOKEN:', NGROK_AUTHTOKEN ? '***' : 'NÃO DEFINIDO');
+    console.log('[DEBUG] allowedOrigins:', allowedOrigins);
+
     // Só inicia o ngrok se não estiver em produção
     if (process.env.NODE_ENV !== 'production' && !process.env.DISABLE_NGROK) {
       await ngrok.authtoken(NGROK_AUTHTOKEN);
@@ -73,19 +84,26 @@ async function startServer() {
         onStatusChange: status => console.log(`ngrok status: ${status}`),
         onLogEvent: data => console.log(`ngrok log: ${data}`)
       });
+      if (ngrokUrl.endsWith('/')) ngrokUrl = ngrokUrl.slice(0, -1);
       app.locals.ngrokUrl = ngrokUrl;
-      require('./router/mercadoLivre').NGROK.url = ngrokUrl; // <-- Aqui atualiza para as rotas do Mercado Livre
       console.log(`ngrok rodando: ${ngrokUrl}`);
     } else {
       ngrokUrl = null;
       app.locals.ngrokUrl = null;
-      require('./router/mercadoLivre').NGROK.url = null;
       console.log('Rodando sem ngrok (produção)');
     }
 
     server.on('error', (err) => {
       console.error('Erro no servidor:', err);
       process.exit(1);
+    });
+
+    // Loga erros não tratados
+    process.on('uncaughtException', (err) => {
+      console.error('[UNCAUGHT EXCEPTION]', err);
+    });
+    process.on('unhandledRejection', (reason, promise) => {
+      console.error('[UNHANDLED REJECTION]', reason);
     });
 
   } catch (err) {
