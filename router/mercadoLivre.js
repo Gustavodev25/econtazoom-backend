@@ -97,7 +97,7 @@ router.get('/callback', async (req, res) => {
       throw new Error('code_verifier não encontrado');
     }
 
-    const tokenResponse = await fetch('https://api.mercadolibre.com/oauth/token', {
+    const tokenResponse = await fetch('https://api.mercadolivre.com/oauth/token', {
       method: 'POST',
       headers: {
         'Accept': 'application/json',
@@ -123,6 +123,12 @@ router.get('/callback', async (req, res) => {
     }
 
     const { access_token, refresh_token, user_id } = tokenData;
+
+    // Validação dos campos obrigatórios
+    if (!access_token || !refresh_token || !user_id) {
+      console.error('Campos obrigatórios ausentes:', { access_token, refresh_token, user_id });
+      throw new Error('Campos obrigatórios ausentes na resposta do Mercado Livre');
+    }
 
     await db.collection('users').doc(uid).collection('mercadoLivre').doc(user_id.toString()).set({
       user_id,
