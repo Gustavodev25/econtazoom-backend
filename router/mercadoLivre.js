@@ -544,5 +544,24 @@ router.delete('/vendas', async (req, res) => {
   }
 });
 
+// Middleware de tratamento de erro para Mercado Livre
+function handleMlError(err, req, res, next) {
+  if (err && err.message && err.message.includes('ENOTFOUND')) {
+    console.error('[MercadoLivre] Erro de DNS ao acessar API do Mercado Livre:', err.message);
+    return res.status(503).json({
+      error: 'Não foi possível acessar a API do Mercado Livre. O servidor não conseguiu resolver o domínio. Isso pode ser uma limitação do ambiente de hospedagem.'
+    });
+  }
+  if (err && err.message && err.message.includes('unsupported')) {
+    console.error('[MercadoLivre] Erro de decodificação de chave:', err.message);
+    return res.status(500).json({
+      error: 'Erro interno ao acessar o Mercado Livre. Verifique as credenciais e tente novamente.'
+    });
+  }
+  next(err);
+}
+
+router.use(handleMlError);
+
 module.exports = router;
 module.exports.NGROK = NGROK;
