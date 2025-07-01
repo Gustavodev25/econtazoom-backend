@@ -2,6 +2,7 @@ const express = require('express');
 const fetch = (...args) => import('node-fetch').then(m => m.default(...args));
 const crypto = require('crypto');
 const router = express.Router();
+const { limit: fbLimit } = require('firebase/firestore'); // Adicione no topo se usar Firestore modular
 
 const CLIENT_ID = '3824907447184431';
 const CLIENT_SECRET = '43I19nlTO0OLK5tw3K0rEeYiDObENV5z';
@@ -90,7 +91,7 @@ router.get('/callback', async (req, res) => {
 
     console.log('Callback chamado com:', { code, state, redirectUri, client_id: CLIENT_ID, codeVerifier });
 
-    const tokenResponse = await fetch('https://api.mercadolibre.com/oauth/token', {
+    const tokenResponse = await fetch('https://api.mercadolivre.com/oauth/token', {
       method: 'POST',
       headers: {
         'Accept': 'application/json',
@@ -118,7 +119,7 @@ router.get('/callback', async (req, res) => {
     const { access_token, refresh_token, user_id } = tokenData;
     console.log('Tokens recebidos:', { user_id, access_token, refresh_token });
 
-    const userResponse = await fetch(`https://api.mercadolibre.com/users/${user_id}`, {
+    const userResponse = await fetch(`https://api.mercadolivre.com/users/${user_id}`, {
       headers: { Authorization: `Bearer ${access_token}` }
     });
     const userData = await userResponse.json();
@@ -183,19 +184,21 @@ router.get('/vendas', async (req, res) => {
     return res.status(400).json({ error: 'UID obrigatório' });
   }
   try {
-    // 1. Buscar SKUs cadastrados do usuário
-    const skusSnap = await db.collection('users').doc(uid).collection('skus').get();
+    // 1. Buscar SKUs cadastrados do usuário (limite de 1000 para evitar quota)
+    const skusSnap = await db.collection('users').doc(uid).collection('skus').limit(1000).get();
+    // Normaliza os SKUs para garantir o join correto (removendo espaços e usando maiúsculas)
+    const normalizeSku = sku => (sku || '').toString().trim().toUpperCase();
     const skusMap = {};
     skusSnap.forEach(doc => {
       const data = doc.data();
       if (data.sku) {
-        skusMap[data.sku] = data;
+        skusMap[normalizeSku(data.sku)] = data;
       }
     });
     console.log('[ML API] SKUs carregados:', Object.keys(skusMap));
 
-    // 2. Buscar vendas já salvas no Firestore
-    const vendasFirestoreSnap = await db.collection('users').doc(uid).collection('mlVendas').get();
+    // 2. Buscar vendas já salvas no Firestore (limite de 1000 para evitar quota)
+    const vendasFirestoreSnap = await db.collection('users').doc(uid).collection('mlVendas').limit(1000).get();
     let vendasFirestore = [];
     let idsFirestore = new Set();
     vendasFirestoreSnap.forEach(doc => {
@@ -205,6 +208,12 @@ router.get('/vendas', async (req, res) => {
       else if (venda.order_id) idsFirestore.add(venda.order_id.toString());
       else if (doc.id) idsFirestore.add(doc.id);
     });
+    if (vendasFirestoreSnap.size === 1000) {
+      return res.status(429).json({
+        error: 'Limite de vendas atingido para consulta. Reduza o volume de dados ou filtre por período.',
+        detalhe: 'O sistema limita a leitura a 1000 vendas por vez para evitar exceder a cota do Firestore.'
+      });
+    }
     console.log('[ML API] Vendas já salvas no Firestore:', vendasFirestore.length);
 
     // 3. Buscar IDs de vendas do Mercado Livre (apenas IDs)
@@ -226,7 +235,7 @@ router.get('/vendas', async (req, res) => {
       let total = 0;
       let vendasResults = [];
       do {
-        const url = `https://api.mercadolibre.com/orders/search?seller=${user_id}&order.status=paid&offset=${offset}&limit=${limit}`;
+        const url = `https://api.mercadolivre.com/orders/search?seller=${user_id}&order.status=paid&offset=${offset}&limit=${limit}`;
         console.log('[ML API] Buscando vendas na URL:', url);
         let vendasRes, vendasData;
         try {
@@ -262,7 +271,7 @@ router.get('/vendas', async (req, res) => {
         const vendasDetalhadas = await Promise.all(novasVendasParaBuscar.map(async (venda) => {
           const orderId = venda.id;
           console.log('[ML API] Buscando detalhes para orderId:', orderId);
-          const orderDetailsRes = await fetch(`https://api.mercadolibre.com/orders/${orderId}`, {
+          const orderDetailsRes = await fetch(`https://api.mercadolivre.com/orders/${orderId}`, {
             headers: { Authorization: `Bearer ${access_token}` }
           });
           const orderDetails = await orderDetailsRes.json();
@@ -270,7 +279,7 @@ router.get('/vendas', async (req, res) => {
           // Busca detalhes do envio, se disponível
           let shipmentDetails = {};
           if (orderDetails.shipping?.id) {
-            const shipmentRes = await fetch(`https://api.mercadolibre.com/shipments/${orderDetails.shipping.id}`, {
+            const shipmentRes = await fetch(`https://api.mercadolivre.com/shipments/${orderDetails.shipping.id}`, {
               headers: { Authorization: `Bearer ${access_token}` }
             });
             shipmentDetails = await shipmentRes.json();
@@ -293,7 +302,8 @@ router.get('/vendas', async (req, res) => {
           // --- JOIN dos SKUs ---
           if (Array.isArray(orderDetails.order_items)) {
             orderDetails.order_items = orderDetails.order_items.map(item => {
-              const sku = item.item?.seller_sku || item.sku || item.SKU || null;
+              // Normaliza o SKU do item para comparar corretamente
+              const sku = normalizeSku(item.item?.seller_sku || item.sku || item.SKU || null);
               if (sku && skusMap[sku]) {
                 return {
                   ...item,
@@ -345,14 +355,65 @@ router.get('/vendas', async (req, res) => {
       } while (vendasResults.length === limit && (total === 0 || offset < total));
     }
 
-    // Junta as vendas já salvas + as novas buscadas
-    const todasVendas = [...vendasFirestore, ...novasVendas];
+    // Atualiza vendas já salvas no Firestore com SKUs normalizados
+    const vendasFirestoreAtualizadas = await Promise.all(
+      vendasFirestore.map(async (venda) => {
+        let alterado = false;
+        if (Array.isArray(venda.order_items)) {
+          const novosOrderItems = venda.order_items.map(item => {
+            const sku = normalizeSku(item.item?.seller_sku || item.sku || item.SKU || null);
+            if (sku && skusMap[sku]) {
+              alterado = true;
+              return {
+                ...item,
+                sku_info: {
+                  hierarquia1: skusMap[sku].hierarquia1 || null,
+                  hierarquia2: skusMap[sku].hierarquia2 || null,
+                  custoUnitario: skusMap[sku].custoUnitario || null,
+                  quantidadeSkuFilho: skusMap[sku].quantidadeSkuFilho || null,
+                  skuFilhos: skusMap[sku].skuFilhos || null
+                }
+              };
+            }
+            return item;
+          });
+          if (alterado) {
+            // Atualiza no Firestore apenas se houve alteração
+            try {
+              await db.collection('users')
+                .doc(uid)
+                .collection('mlVendas')
+                .doc((venda.id || venda.order_id || '').toString())
+                .set({
+                  ...venda,
+                  order_items: novosOrderItems
+                }, { merge: true });
+            } catch (err) {
+              console.warn('[ML API] Falha ao atualizar venda existente com SKUs normalizados:', err.message);
+            }
+            return { ...venda, order_items: novosOrderItems };
+          }
+        }
+        return venda;
+      })
+    );
+
+    // Junta as vendas já salvas (agora atualizadas) + as novas buscadas
+    const todasVendas = [...vendasFirestoreAtualizadas, ...novasVendas];
     console.log('[ML API] Vendas retornadas (Firestore + Novas):', todasVendas.length);
 
     res.json(todasVendas);
   } catch (error) {
+    // Tratamento especial para quota exceeded do Firestore
+    let msg = error?.message || '';
+    if (
+      (msg && msg.toLowerCase().includes('quota')) ||
+      (error?.code === 8 && msg.toLowerCase().includes('resource_exhausted'))
+    ) {
+      msg = 'Limite de uso do banco de dados atingido. Tente novamente mais tarde ou aguarde a renovação da cota do Firestore.';
+    }
     console.error('[ML API] Erro ao buscar vendas Mercado Livre:', error, error?.response?.data || error?.message);
-    res.status(500).json({ error: 'Erro ao buscar vendas do Mercado Livre', detalhe: error?.message });
+    res.status(500).json({ error: 'Erro ao buscar vendas do Mercado Livre', detalhe: msg });
   }
 });
 
@@ -363,18 +424,22 @@ router.get('/vendas/sync', async (req, res) => {
     return res.status(400).json({ error: 'UID obrigatório' });
   }
   try {
+    // Limite de vendas sincronizadas por chamada para evitar quota
+    const MAX_SYNC = 500;
     const contasSnap = await db.collection('users').doc(uid).collection('mercadoLivre').get();
     if (contasSnap.empty) {
       return res.json({ msg: 'Nenhuma conta Mercado Livre conectada' });
     }
 
     let novasVendas = [];
+    let totalSincronizadas = 0;
     for (const doc of contasSnap.docs) {
+      if (totalSincronizadas >= MAX_SYNC) break;
       const conta = doc.data();
       const access_token = conta.access_token;
       const user_id = conta.user_id;
 
-      const url = `https://api.mercadolibre.com/orders/search?seller=${user_id}&order.status=paid`;
+      const url = `https://api.mercadolivre.com/orders/search?seller=${user_id}&order.status=paid&limit=${MAX_SYNC}`;
       const vendasRes = await fetch(url, {
         headers: { Authorization: `Bearer ${access_token}` }
       });
@@ -383,13 +448,14 @@ router.get('/vendas/sync', async (req, res) => {
       if (!Array.isArray(vendasData.results)) continue;
 
       for (const venda of vendasData.results) {
+        if (totalSincronizadas >= MAX_SYNC) break;
         const orderId = venda.id;
         // Verifica se já existe no Firestore
         const vendaDoc = await db.collection('users').doc(uid).collection('mlVendas').doc(orderId.toString()).get();
         if (vendaDoc.exists) continue; // Já existe, não duplica
 
         // Busca detalhes do pedido
-        const orderDetailsRes = await fetch(`https://api.mercadolibre.com/orders/${orderId}`, {
+        const orderDetailsRes = await fetch(`https://api.mercadolivre.com/orders/${orderId}`, {
           headers: { Authorization: `Bearer ${access_token}` }
         });
         const orderDetails = await orderDetailsRes.json();
@@ -397,7 +463,7 @@ router.get('/vendas/sync', async (req, res) => {
         // Busca detalhes do envio, se disponível
         let shipmentDetails = {};
         if (orderDetails.shipping?.id) {
-          const shipmentRes = await fetch(`https://api.mercadolibre.com/shipments/${orderDetails.shipping.id}`, {
+          const shipmentRes = await fetch(`https://api.mercadolivre.com/shipments/${orderDetails.shipping.id}`, {
             headers: { Authorization: `Bearer ${access_token}` }
           });
           shipmentDetails = await shipmentRes.json();
@@ -431,15 +497,52 @@ router.get('/vendas/sync', async (req, res) => {
             shipment_base_cost: shipmentDetails.base_cost || 0,
             updatedAt: new Date().toISOString()
           }, { merge: true });
-
-        novasVendas.push(orderId);
+        totalSincronizadas++;
       }
     }
 
-    res.json({ msg: 'Sincronização concluída', novasVendas });
+    if (totalSincronizadas >= MAX_SYNC) {
+      return res.status(429).json({
+        error: 'Limite de sincronização atingido. Tente novamente mais tarde ou sincronize por períodos menores.',
+        detalhe: `A sincronização foi limitada a ${MAX_SYNC} vendas para evitar exceder a cota do Firestore.`
+      });
+    }
+
+    res.json({ msg: 'Sincronização concluída', novasVendas, totalSincronizadas });
   } catch (error) {
     console.error('Erro ao sincronizar vendas Mercado Livre:', error.message);
     res.status(500).json({ error: 'Erro ao sincronizar vendas do Mercado Livre' });
+  }
+});
+
+// ROTA PARA EXCLUIR TODAS AS VENDAS DO MERCADO LIVRE DE UM USUÁRIO
+router.delete('/vendas', async (req, res) => {
+  const uid = req.query.uid || req.body.uid;
+  if (!uid) {
+    return res.status(400).json({ error: 'UID obrigatório' });
+  }
+  try {
+    const vendasRef = db.collection('users').doc(uid).collection('mlVendas');
+    let deleted = 0;
+    let lastDoc = null;
+    while (true) {
+      let query = vendasRef.limit(500);
+      if (lastDoc) query = query.startAfter(lastDoc);
+      const snap = await query.get();
+      if (snap.empty) break;
+      const batch = db.batch();
+      snap.docs.forEach(doc => {
+        batch.delete(doc.ref);
+      });
+      await batch.commit();
+      deleted += snap.size;
+      if (snap.size < 500) break;
+      lastDoc = snap.docs[snap.docs.length - 1];
+    }
+    res.json({ success: true, deleted });
+  } catch (err) {
+    console.error('[ml/vendas][DELETE] Erro ao excluir:', err);
+    res.status(500).json({ error: 'Erro ao excluir vendas do Mercado Livre', detalhe: err.message });
   }
 });
 

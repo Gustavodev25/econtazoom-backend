@@ -11,7 +11,7 @@ if (process.env.FIREBASE_CONFIG) {
   }
 } else {
   // Ambiente local - inicializa com arquivo JSON
-  serviceAccount = require('./econtazoom-9c5d8-firebase-adminsdk-fbsvc-11744f98b0.json');
+  serviceAccount = require('./econtazoom-teste-firebase-adminsdk-fbsvc-9eb7a86b68.json');
   if (!admin.apps.length) {
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount)
