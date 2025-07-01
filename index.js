@@ -67,43 +67,31 @@ app.get('/', (req, res) => {
 async function startServer() {
   try {
     const server = app.listen(PORT, () => {
-      console.log(`Servidor Express rodando na porta ${PORT}`);
+      // Não mostrar logs detalhados, apenas mensagem simples
     });
-
-    // Loga variáveis de ambiente importantes para debug
-    console.log('[DEBUG] NODE_ENV:', process.env.NODE_ENV);
-    console.log('[DEBUG] NGROK_AUTHTOKEN:', NGROK_AUTHTOKEN ? '***' : 'NÃO DEFINIDO');
-    console.log('[DEBUG] allowedOrigins:', allowedOrigins);
 
     // Só inicia o ngrok se não estiver em produção
     if (process.env.NODE_ENV !== 'production' && !process.env.DISABLE_NGROK) {
       await ngrok.authtoken(NGROK_AUTHTOKEN);
       ngrokUrl = await ngrok.connect({
         addr: PORT,
-        authtoken: NGROK_AUTHTOKEN,
-        onStatusChange: status => console.log(`ngrok status: ${status}`),
-        onLogEvent: data => console.log(`ngrok log: ${data}`)
+        authtoken: NGROK_AUTHTOKEN
       });
       if (ngrokUrl.endsWith('/')) ngrokUrl = ngrokUrl.slice(0, -1);
       app.locals.ngrokUrl = ngrokUrl;
-      console.log(`ngrok rodando: ${ngrokUrl}`);
+      // Mostra apenas mensagem simples e o link do ngrok
+      console.log('Servidor rodando!');
+      console.log('Acesse via ngrok:', ngrokUrl);
     } else {
       ngrokUrl = null;
       app.locals.ngrokUrl = null;
-      console.log('Rodando sem ngrok (produção)');
+      console.log('Servidor rodando!');
+      console.log('Acesse localmente em http://localhost:' + PORT);
     }
 
     server.on('error', (err) => {
       console.error('Erro no servidor:', err);
       process.exit(1);
-    });
-
-    // Loga erros não tratados
-    process.on('uncaughtException', (err) => {
-      console.error('[UNCAUGHT EXCEPTION]', err);
-    });
-    process.on('unhandledRejection', (reason, promise) => {
-      console.error('[UNHANDLED REJECTION]', reason);
     });
 
   } catch (err) {
