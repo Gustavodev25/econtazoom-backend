@@ -2,8 +2,6 @@ const express = require('express');
 const fetch = (...args) => import('node-fetch').then(m => m.default(...args));
 const crypto = require('crypto');
 const router = express.Router();
-const { limit: fbLimit } = require('firebase/firestore'); // Adicione no topo se usar Firestore modular
-
 const CLIENT_ID = '3824907447184431';
 const CLIENT_SECRET = '43I19nlTO0OLK5tw3K0rEeYiDObENV5z';
 const NGROK = { url: null };
