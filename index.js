@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const ngrok = require('ngrok');
+const { NGROK } = require('./router/mercadoLivre');
 const mercadoLivreRouter = require('./router/mercadoLivre');
 const blingRouter = require('./router/bling');
 
@@ -42,10 +43,7 @@ app.use((req, res, next) => {
 });
 
 app.get('/api/ngrok-url', (req, res) => {
-  if (!ngrokUrl) {
-    return res.status(503).json({ error: 'ngrok ainda não inicializado' });
-  }
-  res.json({ url: ngrokUrl });
+  res.json({ url: NGROK.url });
 });
 
 // Endpoint de debug para saber se está usando ngrok/local
@@ -55,7 +53,7 @@ app.get('/api/ngrok-debug', (req, res) => {
     node_env: process.env.NODE_ENV,
     usandoNgrok: !!ngrokUrl,
     mensagem: ngrokUrl
-      ? 'ngrok ativo e backend acessível externamente.'
+      ? 'ngrok ATIVO. Backend acessível externamente.'
       : 'ngrok NÃO está ativo. Backend só acessível localmente.'
   });
 });
@@ -75,16 +73,18 @@ async function startServer() {
       await ngrok.authtoken(NGROK_AUTHTOKEN);
       ngrokUrl = await ngrok.connect({
         addr: PORT,
-        authtoken: NGROK_AUTHTOKEN
+        authtoken: NGROK_AUTHTOKEN,
+        proto: 'http'
       });
       if (ngrokUrl.endsWith('/')) ngrokUrl = ngrokUrl.slice(0, -1);
       app.locals.ngrokUrl = ngrokUrl;
-      // Mostra apenas mensagem simples e o link do ngrok
+      NGROK.url = ngrokUrl; // <-- importante para o router/mercadoLivre.js
       console.log('Servidor rodando!');
       console.log('Acesse via ngrok:', ngrokUrl);
     } else {
       ngrokUrl = null;
       app.locals.ngrokUrl = null;
+      NGROK.url = null;
       console.log('Servidor rodando!');
       console.log('Acesse localmente em http://localhost:' + PORT);
     }
