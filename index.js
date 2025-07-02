@@ -4,6 +4,7 @@ const ngrok = require('ngrok');
 const { NGROK } = require('./router/mercadoLivre');
 const mercadoLivreRouter = require('./router/mercadoLivre');
 const blingRouter = require('./router/bling');
+const { db } = require('./firebase');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -11,17 +12,15 @@ const NGROK_AUTHTOKEN = process.env.NGROK_AUTHTOKEN || '1oqB3iP42FXti1LBFru5iA0K
 
 let ngrokUrl = null;
 
-// Permitir CORS para localhost, produção e ngrok
 const allowedOrigins = [
   'http://localhost:8080',
   'http://localhost:3000',
   'https://econtazoom.vercel.app',
   'https://econtazoom-backend.onrender.com',
-  'https://econtazoom.com.br', // Adicionado domínio de produção
+  'https://econtazoom.com.br',
 ];
 app.use(cors({
   origin: function(origin, callback) {
-    // Permite requisições sem origin (ex: mobile, curl)
     if (!origin) return callback(null, true);
     if (allowedOrigins.includes(origin) || origin.includes('ngrok')) {
       return callback(null, true);
@@ -36,7 +35,6 @@ app.use(express.json());
 app.use('/ml', mercadoLivreRouter);
 app.use('/bling', blingRouter);
 
-// Força o log de todas as requisições recebidas e erros não tratados
 app.use((req, res, next) => {
   console.log(`[Express] ${req.method} ${req.url} - Body:`, req.body, '- Query:', req.query);
   next();
@@ -46,7 +44,6 @@ app.get('/api/ngrok-url', (req, res) => {
   res.json({ url: NGROK.url });
 });
 
-// Endpoint de debug para saber se está usando ngrok/local
 app.get('/api/ngrok-debug', (req, res) => {
   res.json({
     ngrokUrl,
@@ -62,13 +59,17 @@ app.get('/', (req, res) => {
   res.send('Backend Express rodando!');
 });
 
+db.collection('test').limit(1).get().then(() => {
+  console.log('Firestore autenticado com sucesso!');
+}).catch(err => {
+  console.error('Erro ao autenticar no Firestore:', err);
+});
+
 async function startServer() {
   try {
     const server = app.listen(PORT, () => {
-      // Não mostrar logs detalhados, apenas mensagem simples
     });
 
-    // Só inicia o ngrok se não estiver em produção
     if (process.env.NODE_ENV !== 'production' && !process.env.DISABLE_NGROK) {
       await ngrok.authtoken(NGROK_AUTHTOKEN);
       ngrokUrl = await ngrok.connect({
@@ -78,7 +79,7 @@ async function startServer() {
       });
       if (ngrokUrl.endsWith('/')) ngrokUrl = ngrokUrl.slice(0, -1);
       app.locals.ngrokUrl = ngrokUrl;
-      NGROK.url = ngrokUrl; // <-- importante para o router/mercadoLivre.js
+      NGROK.url = ngrokUrl;
       console.log('Servidor rodando!');
       console.log('Acesse via ngrok:', ngrokUrl);
     } else {

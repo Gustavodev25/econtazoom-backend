@@ -43,6 +43,118 @@ function getFrontendUrl(success = true) {
   return `${baseUrl}?${query}`;
 }
 
+// Corrija o mapeamento do tipo de anúncio para garantir "Grátis", "Clássico" ou "Premium"
+function mapearTipoAnuncio(listingTypeId) {
+  if (!listingTypeId || listingTypeId === '-') return '-';
+  const id = listingTypeId.toLowerCase();
+  if (id === 'gold_pro' || id === 'premium') return 'Premium';
+  if (id === 'gold_special' || id === 'classic') return 'Clássico';
+  if (id === 'free') return 'Grátis';
+  return '-';
+}
+
+// Torne calcularTaxaAnuncio global
+function calcularTaxaAnuncio(listingType, precoUnit) {
+  precoUnit = Number(precoUnit || 0);
+  if (listingType === 'gold_pro' || listingType === 'premium') {
+    return { tipo: 'Premium', comissao: 0.17, custoFixo: 0 };
+  } else if (listingType === 'gold_special' || listingType === 'classic') {
+    if (precoUnit < 79) {
+      return { tipo: 'Clássico', comissao: 0.12, custoFixo: 6.5 };
+    } else {
+      return { tipo: 'Clássico', comissao: 0.12, custoFixo: 0 };
+    }
+  } else if (listingType === 'free') {
+    return { tipo: 'Grátis', comissao: 0, custoFixo: 0 };
+  }
+  return { tipo: listingType || '-', comissao: 0, custoFixo: 0 };
+}
+
+// Nova função para calcular a taxa real dos payments (mercadopago_fee + marketplace_fee)
+function calcularTaxaPayments(payments) {
+  if (!Array.isArray(payments)) return 0;
+  let total = 0;
+  payments.forEach(payment => {
+    if (typeof payment.mercadopago_fee === 'number') total += payment.mercadopago_fee;
+    if (typeof payment.marketplace_fee === 'number') total += payment.marketplace_fee;
+    // Fallback: fee_details
+    if (Array.isArray(payment.fee_details)) {
+      payment.fee_details.forEach(fee => {
+        if (['marketplace_fee', 'mercadopago_fee'].includes(fee.type)) {
+          total += fee.amount || 0;
+        }
+      });
+    }
+  });
+  return total;
+}
+
+function formatarTaxaPayments(payments) {
+  if (!Array.isArray(payments)) return '0,00';
+  let total = 0;
+  payments.forEach(payment => {
+    if (typeof payment.mercadopago_fee === 'number') total += payment.mercadopago_fee;
+    if (typeof payment.marketplace_fee === 'number') total += payment.marketplace_fee;
+  });
+  // Multiplica por -1 conforme regra
+  total = total * -1;
+  // Formata com duas casas e vírgula
+  return total.toFixed(2).replace('.', ',');
+}
+
+// Corrija o cálculo detalhado da taxa da plataforma conforme a tabela fornecida
+function calcularTaxaPlataformaMercadoLivre({ tipoAnuncio, precoUnit, quantidade }) {
+  let comissao = 0;
+  let custoFixo = 0;
+  let faixaComissao = '';
+  precoUnit = Number(precoUnit || 0);
+  quantidade = Number(quantidade || 1);
+
+  if (!tipoAnuncio) tipoAnuncio = '-';
+  const tipo = tipoAnuncio.toLowerCase();
+
+  if (tipo === 'grátis' || tipo === 'gratis' || tipo === 'free') {
+    comissao = 0;
+    custoFixo = 0;
+    faixaComissao = '0%';
+  } else if (tipo === 'clássico' || tipo === 'classico') {
+    if (precoUnit < 79) {
+      comissao = 0.12;
+      custoFixo = 6.0;
+      faixaComissao = '12% + R$ 6,00';
+    } else {
+      comissao = 0.12;
+      custoFixo = 0;
+      faixaComissao = '12%';
+    }
+  } else if (tipo === 'premium') {
+    if (precoUnit < 79) {
+      comissao = 0.16;
+      custoFixo = 6.0;
+      faixaComissao = '16% + R$ 6,00';
+    } else {
+      comissao = 0.16;
+      custoFixo = 0;
+      faixaComissao = '16%';
+    }
+  } else {
+    comissao = 0;
+    custoFixo = 0;
+    faixaComissao = '0%';
+  }
+
+  // Valor total da taxa para a quantidade vendida
+  const taxaTotal = ((precoUnit * comissao) + custoFixo) * quantidade;
+
+  return {
+    tipoAnuncio,
+    faixaComissao,
+    comissaoPercentual: comissao,
+    custoFixo,
+    taxaTotal: Number(taxaTotal.toFixed(2))
+  };
+}
+
 router.get('/auth', async (req, res) => {
   const { uid } = req.query;
   if (!uid) {
@@ -61,8 +173,8 @@ router.get('/auth', async (req, res) => {
 
     codeVerifiers.set(state, codeVerifier);
 
-    const url = `https://auth.mercadolivre.com.br/authorization?response_type=code&client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}&code_challenge=${codeChallenge}&code_challenge_method=S256&scope=offline_access`;
-    
+    const url = `https://auth.mercadolibre.com.br/authorization?response_type=code&client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}&code_challenge=${codeChallenge}&code_challenge_method=S256&scope=offline_access`;
+
     console.log('Iniciando autenticação com:', { redirectUri, state, codeChallenge, scope: 'offline_access' });
     res.redirect(url);
   } catch (error) {
@@ -141,7 +253,7 @@ router.get('/callback', async (req, res) => {
       user_id,
       nickname,
       access_token,
-      refresh_token: refresh_token || null, // Fallback to null if undefined
+      refresh_token: refresh_token || null,
       status: 'ativo',
       createdAt: new Date().toISOString(),
       expires_in,
@@ -192,9 +304,8 @@ router.get('/vendas', async (req, res) => {
     return res.status(400).json({ error: 'UID obrigatório' });
   }
   try {
-    // 1. Buscar SKUs cadastrados do usuário (limite de 1000 para evitar quota)
+    // Carrega SKUs do Firestore (para enriquecer se necessário)
     const skusSnap = await db.collection('users').doc(uid).collection('skus').limit(1000).get();
-    // Normaliza os SKUs para garantir o join correto (removendo espaços e usando maiúsculas)
     const normalizeSku = sku => (sku || '').toString().trim().toUpperCase();
     const skusMap = {};
     skusSnap.forEach(doc => {
@@ -203,218 +314,223 @@ router.get('/vendas', async (req, res) => {
         skusMap[normalizeSku(data.sku)] = data;
       }
     });
-    console.log('[ML API] SKUs carregados:', Object.keys(skusMap));
 
-    // 2. Buscar vendas já salvas no Firestore (limite de 1000 para evitar quota)
+    // Carrega vendas do Firestore
     const vendasFirestoreSnap = await db.collection('users').doc(uid).collection('mlVendas').limit(1000).get();
     let vendasFirestore = [];
     let idsFirestore = new Set();
     vendasFirestoreSnap.forEach(doc => {
       const venda = doc.data();
-      vendasFirestore.push(venda);
-      if (venda.id) idsFirestore.add(venda.id.toString());
-      else if (venda.order_id) idsFirestore.add(venda.order_id.toString());
-      else if (doc.id) idsFirestore.add(doc.id);
+      vendasFirestore.push({ ...venda, _firestoreId: doc.id });
+      const id = venda.id?.toString() || venda.order_id?.toString() || doc.id;
+      idsFirestore.add(id);
     });
     if (vendasFirestoreSnap.size === 1000) {
       return res.status(429).json({
         error: 'Limite de vendas atingido para consulta. Reduza o volume de dados ou filtre por período.',
-        detalhe: 'O sistema limita a leitura a 1000 vendas por vez para evitar exceder a cota do Firestore.'
+        detalhe: 'O sistema limita a leitura a 1000 vendas por vez.'
       });
     }
     console.log('[ML API] Vendas já salvas no Firestore:', vendasFirestore.length);
 
-    // 3. Buscar IDs de vendas do Mercado Livre (apenas IDs)
+    // Carrega contas Mercado Livre conectadas
     const contasSnap = await db.collection('users').doc(uid).collection('mercadoLivre').get();
     if (contasSnap.empty) {
       console.warn('[ML API] Nenhuma conta Mercado Livre conectada para o usuário:', uid);
       return res.json([]);
     }
 
-    let novasVendas = [];
-    for (const docConta of contasSnap.docs) {
-      const conta = docConta.data();
-      const access_token = conta.access_token;
-      const user_id = conta.user_id;
-      console.log(`[ML API] Buscando vendas para user_id: ${user_id}`);
-
-      let offset = 0;
-      const limit = 50;
-      let total = 0;
-      let vendasResults = [];
-      do {
-        // Corrigido: api.mercadolibre.com
-        const url = `https://api.mercadolibre.com/orders/search?seller=${user_id}&order.status=paid&offset=${offset}&limit=${limit}`;
-        console.log('[ML API] Buscando vendas na URL:', url);
-        let vendasRes, vendasData;
-        try {
-          vendasRes = await fetch(url, {
-            headers: { Authorization: `Bearer ${access_token}` }
-          });
-          const text = await vendasRes.text();
-          try {
-            vendasData = JSON.parse(text);
-          } catch (jsonErr) {
-            console.error('[ML API] Erro ao fazer parse do JSON da resposta do Mercado Livre:', jsonErr, 'Resposta bruta:', text);
-            vendasData = { results: [] };
-          }
-        } catch (fetchErr) {
-          console.error('[ML API] Erro de rede/fetch ao buscar vendas:', fetchErr);
-          vendasData = { results: [] };
-        }
-        if (!Array.isArray(vendasData.results)) break;
-        if (offset === 0 && vendasData.paging && vendasData.paging.total) {
-          total = vendasData.paging.total;
-        }
-        vendasResults = vendasData.results;
-        if (!vendasResults.length) break;
-
-        const novasVendasParaBuscar = vendasResults.filter(venda => {
-          const id = venda.id?.toString();
-          return id && !idsFirestore.has(id);
+    // Função para buscar detalhes completos de uma venda na API do Mercado Livre
+    async function fetchOrderDetails(orderId, access_token) {
+      try {
+        const orderRes = await fetch(`https://api.mercadolibre.com/orders/${orderId}`, {
+          headers: { Authorization: `Bearer ${access_token}` }
         });
-
-        const vendasDetalhadas = await Promise.all(novasVendasParaBuscar.map(async (venda) => {
-          const orderId = venda.id;
-          console.log('[ML API] Buscando detalhes para orderId:', orderId);
-          // Corrigido: api.mercadolibre.com
-          const orderDetailsRes = await fetch(`https://api.mercadolibre.com/orders/${orderId}`, {
-            headers: { Authorization: `Bearer ${access_token}` }
-          });
-          const orderDetails = await orderDetailsRes.json();
-
-          let shipmentDetails = {};
-          if (orderDetails.shipping?.id) {
-            // Corrigido: api.mercadolibre.com
-            const shipmentRes = await fetch(`https://api.mercadolibre.com/shipments/${orderDetails.shipping.id}`, {
+        const orderData = await orderRes.json();
+        if (!orderRes.ok) {
+          console.warn(`[ML API] Falha ao buscar detalhes da order ${orderId}:`, orderData);
+          return null;
+        }
+        // Busca detalhes de envio se houver
+        let shipmentDetails = {};
+        if (orderData.shipping?.id) {
+          try {
+            const shipmentRes = await fetch(`https://api.mercadolibre.com/shipments/${orderData.shipping.id}`, {
               headers: { Authorization: `Bearer ${access_token}` }
             });
             shipmentDetails = await shipmentRes.json();
-          }
-
-          let ml_fee = 0;
-          if (Array.isArray(orderDetails.payments)) {
-            orderDetails.payments.forEach(payment => {
-              if (Array.isArray(payment.fee_details)) {
-                payment.fee_details.forEach(fee => {
-                  if (['marketplace_fee', 'mercadopago_fee'].includes(fee.type)) {
-                    ml_fee += fee.amount || 0;
-                  }
-                });
-              }
-            });
-          }
-
-          if (Array.isArray(orderDetails.order_items)) {
-            orderDetails.order_items = orderDetails.order_items.map(item => {
-              const sku = normalizeSku(item.item?.seller_sku || item.sku || item.SKU || null);
-              if (sku && skusMap[sku]) {
-                return {
-                  ...item,
-                  sku_info: {
-                    hierarquia1: skusMap[sku].hierarquia1 || null,
-                    hierarquia2: skusMap[sku].hierarquia2 || null,
-                    custoUnitario: skusMap[sku].custoUnitario || null,
-                    quantidadeSkuFilho: skusMap[sku].quantidadeSkuFilho || null,
-                    skuFilhos: skusMap[sku].skuFilhos || null
-                  }
-                };
-              }
-              return item;
-            });
-          }
-
-          try {
-            await db.collection('users')
-              .doc(uid)
-              .collection('mlVendas')
-              .doc(orderId.toString())
-              .set({
-                ...orderDetails,
-                shipping: shipmentDetails,
-                ml_fee: ml_fee,
-                ads: orderDetails.payments?.[0]?.coupon_amount || 0,
-                shipment_list_cost: shipmentDetails.list_cost || orderDetails.shipping?.cost || 0,
-                shipment_base_cost: shipmentDetails.base_cost || 0,
-                updatedAt: new Date().toISOString()
-              }, { merge: true });
           } catch (err) {
-            console.error(`[ML API] Erro ao salvar venda ${orderId} no Firestore:`, err.message);
-          }
-
-          return {
-            ...orderDetails,
-            shipping: shipmentDetails,
-            ml_fee: ml_fee,
-            ads: orderDetails.payments?.[0]?.coupon_amount || 0,
-            shipment_list_cost: shipmentDetails.list_cost || orderDetails.shipping?.cost || 0,
-            shipment_base_cost: shipmentDetails.base_cost || 0
-          };
-        }));
-
-        novasVendas = novasVendas.concat(vendasDetalhadas);
-
-        offset += limit;
-      } while (vendasResults.length === limit && (total === 0 || offset < total));
-    }
-
-    const vendasFirestoreAtualizadas = await Promise.all(
-      vendasFirestore.map(async (venda) => {
-        let alterado = false;
-        if (Array.isArray(venda.order_items)) {
-          const novosOrderItems = venda.order_items.map(item => {
-            const sku = normalizeSku(item.item?.seller_sku || item.sku || item.SKU || null);
-            if (sku && skusMap[sku]) {
-              alterado = true;
-              return {
-                ...item,
-                sku_info: {
-                  hierarquia1: skusMap[sku].hierarquia1 || null,
-                  hierarquia2: skusMap[sku].hierarquia2 || null,
-                  custoUnitario: skusMap[sku].custoUnitario || null,
-                  quantidadeSkuFilho: skusMap[sku].quantidadeSkuFilho || null,
-                  skuFilhos: skusMap[sku].skuFilhos || null
-                }
-              };
-            }
-            return item;
-          });
-          if (alterado) {
-            try {
-              await db.collection('users')
-                .doc(uid)
-                .collection('mlVendas')
-                .doc((venda.id || venda.order_id || '').toString())
-                .set({
-                  ...venda,
-                  order_items: novosOrderItems
-                }, { merge: true });
-            } catch (err) {
-              console.warn('[ML API] Falha ao atualizar venda existente com SKUs normalizados:', err.message);
-            }
-            return { ...venda, order_items: novosOrderItems };
+            shipmentDetails = {};
           }
         }
+        // Busca descontos se houver
+        let discounts = null;
+        try {
+          const discountsRes = await fetch(`https://api.mercadolibre.com/orders/${orderId}/discounts`, {
+            headers: { Authorization: `Bearer ${access_token}` }
+          });
+          if (discountsRes.ok) {
+            discounts = await discountsRes.json();
+          }
+        } catch (err) {
+          discounts = null;
+        }
+        // Busca feedback se houver
+        let feedback = null;
+        try {
+          const feedbackRes = await fetch(`https://api.mercadolibre.com/orders/${orderId}/feedback`, {
+            headers: { Authorization: `Bearer ${access_token}` }
+          });
+          if (feedbackRes.ok) {
+            feedback = await feedbackRes.json();
+          }
+        } catch (err) {
+          feedback = null;
+        }
+        // Busca taxas reais se houver
+        let ml_fee_real = null;
+        try {
+          const feesRes = await fetch(`https://api.mercadolibre.com/orders/${orderId}/fees`, {
+            headers: { Authorization: `Bearer ${access_token}` }
+          });
+          if (feesRes.ok) {
+            const feesData = await feesRes.json();
+            if (typeof feesData.total_fee === 'number') {
+              ml_fee_real = feesData.total_fee;
+            }
+          }
+        } catch (err) {
+          ml_fee_real = null;
+        }
+        // Enriquecer order_items com tipo de anúncio e taxas
+        if (Array.isArray(orderData.order_items)) {
+          orderData.order_items = await Promise.all(orderData.order_items.map(async item => {
+            const sku = normalizeSku(item.item?.seller_sku || item.sku || item.SKU || null);
+            const precoUnit = item.unit_price || 0;
+            let listingType = item.listing_type_id || item.tipo_anuncio || item.listing_type || '-';
+
+            // Buscar listing_type_id se ausente
+            if ((!listingType || listingType === '-') && item.item?.id) {
+              try {
+                const itRes = await fetch(`https://api.mercadolibre.com/items/${item.item.id}?attributes=listing_type_id`, {
+                  headers: { Authorization: `Bearer ${access_token}` }
+                });
+                const itemData = await itRes.json();
+                listingType = itemData.listing_type_id || '-';
+              } catch {
+                listingType = '-';
+              }
+            }
+
+            // Mapear tipo de anúncio e taxas
+            const tipoAnuncio = mapearTipoAnuncio(listingType);
+
+            // Cálculo detalhado da taxa da plataforma
+            const taxaDetalhada = calcularTaxaPlataformaMercadoLivre({
+              tipoAnuncio,
+              precoUnit,
+              quantidade: item.quantity || 1
+            });
+
+            return {
+              ...item,
+              listing_type_id: listingType,
+              tipo_anuncio: tipoAnuncio,
+              faixa_comissao: taxaDetalhada.faixaComissao,
+              comissao_percentual: taxaDetalhada.comissaoPercentual,
+              custo_fixo: taxaDetalhada.custoFixo,
+              taxa_plataforma_calculada: taxaDetalhada.taxaTotal,
+              sku_info: sku && skusMap[sku] ? {
+                hierarquia1: skusMap[sku].hierarquia1 || null,
+                hierarquia2: skusMap[sku].hierarquia2 || null,
+                custoUnitario: skusMap[sku].custoUnitario || null,
+                quantidadeSkuFilho: skusMap[sku].quantidadeSkuFilho || null,
+                skuFilhos: skusMap[sku].skuFilhos || null
+              } : undefined
+            };
+          }));
+        }
+
+        // Corrige taxa_plataforma_total para usar payments se disponível e envia formatada
+        if (orderData.payments && Array.isArray(orderData.payments) && orderData.payments.length > 0) {
+          orderData.taxa_plataforma_total = calcularTaxaPayments(orderData.payments);
+          orderData.taxa_payments_formatada = formatarTaxaPayments(orderData.payments);
+        } else if (orderData.order_items && Array.isArray(orderData.order_items)) {
+          orderData.taxa_plataforma_total = orderData.order_items.reduce((acc, item) => acc + (item.taxa_plataforma_calculada || 0), 0);
+          orderData.taxa_payments_formatada = orderData.taxa_plataforma_total.toFixed(2).replace('.', ',');
+        }
+
+        // Retorna todos os dados detalhados
+        return {
+          ...orderData,
+          shipping_details: shipmentDetails,
+          discounts,
+          feedback,
+          ml_fee_real
+        };
+      } catch (err) {
+        console.warn(`[ML API] Falha ao buscar detalhes completos da order ${orderId}:`, err.message);
+        return null;
+      }
+    }
+
+    // Monta um map de user_id -> access_token
+    const contasTokens = {};
+    contasSnap.forEach(doc => {
+      const conta = doc.data();
+      if (conta.user_id && conta.access_token) {
+        contasTokens[conta.user_id] = conta.access_token;
+      }
+    });
+
+    // Para cada venda do Firestore, busca detalhes completos se necessário
+    const vendasDetalhadas = await Promise.all(
+      vendasFirestore.map(async venda => {
+        const orderId = venda.id?.toString() || venda.order_id?.toString() || venda._firestoreId;
+        const user_id = venda.seller?.id || venda.seller_id || venda.sellerId || venda.seller || null;
+        // Tenta pegar o access_token da conta correspondente
+        let access_token = null;
+        // Busca pelo seller_id, se não, pega o primeiro token disponível
+        if (user_id && contasTokens[user_id]) {
+          access_token = contasTokens[user_id];
+        } else if (Object.values(contasTokens).length > 0) {
+          access_token = Object.values(contasTokens)[0];
+        }
+        // Se já tem todos os campos detalhados (order_items, payments, buyer, seller, shipping, etc), retorna direto
+        if (
+          venda.order_items && Array.isArray(venda.order_items) &&
+          venda.payments && Array.isArray(venda.payments) &&
+          venda.buyer && venda.seller && venda.shipping
+        ) {
+          // Adiciona ml_fee_real se não existir
+          if (venda.ml_fee_real === undefined && access_token) {
+            const details = await fetchOrderDetails(orderId, access_token);
+            if (details && details.ml_fee_real !== undefined) {
+              return { ...venda, ml_fee_real: details.ml_fee_real };
+            }
+          }
+          return venda;
+        }
+        // Se não, busca detalhes completos na API
+        if (access_token) {
+          const details = await fetchOrderDetails(orderId, access_token);
+          if (details) {
+            // Mescla dados do Firestore com os detalhados da API
+            return { ...venda, ...details };
+          }
+        }
+        // Se não conseguir buscar detalhes, retorna o que tem
         return venda;
       })
     );
 
-    const todasVendas = [...vendasFirestoreAtualizadas, ...novasVendas];
-    console.log('[ML API] Vendas retornadas (Firestore + Novas):', todasVendas.length);
-
-    res.json(todasVendas);
+    res.json(vendasDetalhadas);
   } catch (error) {
-    let msg = error?.message || '';
-    if (
-      (msg && msg.toLowerCase().includes('quota')) ||
-      (error?.code === 8 && msg.toLowerCase().includes('resource_exhausted'))
-    ) {
-      msg = 'Limite de uso do banco de dados atingido. Tente novamente mais tarde ou aguarde a renovação da cota do Firestore.';
-    }
-    console.error('[ML API] Erro ao buscar vendas Mercado Livre:', error, error?.response?.data || error?.message);
-    res.status(500).json({ error: 'Erro ao buscar vendas do Mercado Livre', detalhe: msg });
+    console.error('[ML API] Erro ao buscar vendas Mercado Livre:', error.message, error.stack);
+    res.status(500).json({ error: 'Erro ao buscar vendas do Mercado Livre', detalhe: error.message });
   }
 });
+
 
 router.get('/vendas/sync', async (req, res) => {
   const { uid } = req.query;
@@ -436,7 +552,6 @@ router.get('/vendas/sync', async (req, res) => {
       const access_token = conta.access_token;
       const user_id = conta.user_id;
 
-      // Corrigido: api.mercadolibre.com
       const url = `https://api.mercadolibre.com/orders/search?seller=${user_id}&order.status=paid&limit=${MAX_SYNC}`;
       const vendasRes = await fetch(url, {
         headers: { Authorization: `Bearer ${access_token}` }
@@ -451,7 +566,6 @@ router.get('/vendas/sync', async (req, res) => {
         const vendaDoc = await db.collection('users').doc(uid).collection('mlVendas').doc(orderId.toString()).get();
         if (vendaDoc.exists) continue;
 
-        // Corrigido: api.mercadolibre.com
         const orderDetailsRes = await fetch(`https://api.mercadolibre.com/orders/${orderId}`, {
           headers: { Authorization: `Bearer ${access_token}` }
         });
@@ -459,7 +573,6 @@ router.get('/vendas/sync', async (req, res) => {
 
         let shipmentDetails = {};
         if (orderDetails.shipping?.id) {
-          // Corrigido: api.mercadolibre.com
           const shipmentRes = await fetch(`https://api.mercadolibre.com/shipments/${orderDetails.shipping.id}`, {
             headers: { Authorization: `Bearer ${access_token}` }
           });
