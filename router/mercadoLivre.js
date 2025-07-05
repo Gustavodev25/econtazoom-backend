@@ -141,7 +141,7 @@ router.get('/callback', async (req, res) => {
       user_id,
       nickname,
       access_token,
-      refresh_token: refresh_token || null, // Fallback to null if undefined
+      refresh_token: refresh_token || null,
       status: 'ativo',
       createdAt: new Date().toISOString(),
       expires_in,
@@ -192,9 +192,7 @@ router.get('/vendas', async (req, res) => {
     return res.status(400).json({ error: 'UID obrigatório' });
   }
   try {
-    // 1. Buscar SKUs cadastrados do usuário (limite de 1000 para evitar quota)
     const skusSnap = await db.collection('users').doc(uid).collection('skus').limit(1000).get();
-    // Normaliza os SKUs para garantir o join correto (removendo espaços e usando maiúsculas)
     const normalizeSku = sku => (sku || '').toString().trim().toUpperCase();
     const skusMap = {};
     skusSnap.forEach(doc => {
@@ -205,7 +203,6 @@ router.get('/vendas', async (req, res) => {
     });
     console.log('[ML API] SKUs carregados:', Object.keys(skusMap));
 
-    // 2. Buscar vendas já salvas no Firestore (limite de 1000 para evitar quota)
     const vendasFirestoreSnap = await db.collection('users').doc(uid).collection('mlVendas').limit(1000).get();
     let vendasFirestore = [];
     let idsFirestore = new Set();
@@ -224,7 +221,6 @@ router.get('/vendas', async (req, res) => {
     }
     console.log('[ML API] Vendas já salvas no Firestore:', vendasFirestore.length);
 
-    // 3. Buscar IDs de vendas do Mercado Livre (apenas IDs)
     const contasSnap = await db.collection('users').doc(uid).collection('mercadoLivre').get();
     if (contasSnap.empty) {
       console.warn('[ML API] Nenhuma conta Mercado Livre conectada para o usuário:', uid);
@@ -243,7 +239,6 @@ router.get('/vendas', async (req, res) => {
       let total = 0;
       let vendasResults = [];
       do {
-        // Corrigido: api.mercadolibre.com
         const url = `https://api.mercadolibre.com/orders/search?seller=${user_id}&order.status=paid&offset=${offset}&limit=${limit}`;
         console.log('[ML API] Buscando vendas na URL:', url);
         let vendasRes, vendasData;
@@ -274,18 +269,44 @@ router.get('/vendas', async (req, res) => {
           return id && !idsFirestore.has(id);
         });
 
+        if (novasVendasParaBuscar.length === 0) {
+          offset += limit;
+          continue;
+        }
+
         const vendasDetalhadas = await Promise.all(novasVendasParaBuscar.map(async (venda) => {
           const orderId = venda.id;
           console.log('[ML API] Buscando detalhes para orderId:', orderId);
-          // Corrigido: api.mercadolibre.com
           const orderDetailsRes = await fetch(`https://api.mercadolibre.com/orders/${orderId}`, {
             headers: { Authorization: `Bearer ${access_token}` }
           });
           const orderDetails = await orderDetailsRes.json();
 
+          let discounts = [];
+          try {
+            const discountsRes = await fetch(`https://api.mercadolibre.com/orders/${orderId}/discounts`, {
+              headers: { Authorization: `Bearer ${access_token}` }
+            });
+            const discountsData = await discountsRes.json();
+            if (discountsData && Array.isArray(discountsData.details)) {
+              discounts = discountsData.details;
+            }
+          } catch (discountErr) {
+            console.warn('[ML API] Falha ao buscar descontos da venda:', orderId, discountErr.message);
+          }
+
+          let feedback = {};
+          try {
+            const feedbackRes = await fetch(`https://api.mercadolibre.com/orders/${orderId}/feedback`, {
+              headers: { Authorization: `Bearer ${access_token}` }
+            });
+            feedback = await feedbackRes.json();
+          } catch (feedbackErr) {
+            console.warn('[ML API] Falha ao buscar feedback da venda:', orderId, feedbackErr.message);
+          }
+
           let shipmentDetails = {};
           if (orderDetails.shipping?.id) {
-            // Corrigido: api.mercadolibre.com
             const shipmentRes = await fetch(`https://api.mercadolibre.com/shipments/${orderDetails.shipping.id}`, {
               headers: { Authorization: `Bearer ${access_token}` }
             });
@@ -324,6 +345,25 @@ router.get('/vendas', async (req, res) => {
             });
           }
 
+          let buyer = orderDetails.buyer;
+          let seller = orderDetails.seller;
+          try {
+            if (buyer && buyer.id) {
+              const buyerRes = await fetch(`https://api.mercadolibre.com/users/${buyer.id}`, {
+                headers: { Authorization: `Bearer ${access_token}` }
+              });
+              buyer = await buyerRes.json();
+            }
+          } catch (err) { }
+          try {
+            if (seller && seller.id) {
+              const sellerRes = await fetch(`https://api.mercadolibre.com/users/${seller.id}`, {
+                headers: { Authorization: `Bearer ${access_token}` }
+              });
+              seller = await sellerRes.json();
+            }
+          } catch (err) { }
+
           try {
             await db.collection('users')
               .doc(uid)
@@ -336,7 +376,11 @@ router.get('/vendas', async (req, res) => {
                 ads: orderDetails.payments?.[0]?.coupon_amount || 0,
                 shipment_list_cost: shipmentDetails.list_cost || orderDetails.shipping?.cost || 0,
                 shipment_base_cost: shipmentDetails.base_cost || 0,
-                updatedAt: new Date().toISOString()
+                updatedAt: new Date().toISOString(),
+                discounts,
+                feedback,
+                buyer,
+                seller
               }, { merge: true });
           } catch (err) {
             console.error(`[ML API] Erro ao salvar venda ${orderId} no Firestore:`, err.message);
@@ -348,7 +392,11 @@ router.get('/vendas', async (req, res) => {
             ml_fee: ml_fee,
             ads: orderDetails.payments?.[0]?.coupon_amount || 0,
             shipment_list_cost: shipmentDetails.list_cost || orderDetails.shipping?.cost || 0,
-            shipment_base_cost: shipmentDetails.base_cost || 0
+            shipment_base_cost: shipmentDetails.base_cost || 0,
+            discounts,
+            feedback,
+            buyer,
+            seller
           };
         }));
 
@@ -436,7 +484,6 @@ router.get('/vendas/sync', async (req, res) => {
       const access_token = conta.access_token;
       const user_id = conta.user_id;
 
-      // Corrigido: api.mercadolibre.com
       const url = `https://api.mercadolibre.com/orders/search?seller=${user_id}&order.status=paid&limit=${MAX_SYNC}`;
       const vendasRes = await fetch(url, {
         headers: { Authorization: `Bearer ${access_token}` }
@@ -451,7 +498,6 @@ router.get('/vendas/sync', async (req, res) => {
         const vendaDoc = await db.collection('users').doc(uid).collection('mlVendas').doc(orderId.toString()).get();
         if (vendaDoc.exists) continue;
 
-        // Corrigido: api.mercadolibre.com
         const orderDetailsRes = await fetch(`https://api.mercadolibre.com/orders/${orderId}`, {
           headers: { Authorization: `Bearer ${access_token}` }
         });
@@ -459,7 +505,6 @@ router.get('/vendas/sync', async (req, res) => {
 
         let shipmentDetails = {};
         if (orderDetails.shipping?.id) {
-          // Corrigido: api.mercadolibre.com
           const shipmentRes = await fetch(`https://api.mercadolibre.com/shipments/${orderDetails.shipping.id}`, {
             headers: { Authorization: `Bearer ${access_token}` }
           });
@@ -540,10 +585,6 @@ router.delete('/vendas', async (req, res) => {
   }
 });
 
-/**
- * Cria uma venda fake do Mercado Livre para testes locais.
- * POST /ml/vendas/fake?uid=USER_ID
- */
 router.post('/vendas/fake', async (req, res) => {
   const uid = req.query.uid || req.body.uid;
   if (!uid) {

@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const bodyParser = require('body-parser');
 const ngrok = require('ngrok');
 const { NGROK } = require('./router/mercadoLivre');
 const mercadoLivreRouter = require('./router/mercadoLivre');
@@ -7,6 +8,12 @@ const blingRouter = require('./router/bling');
 const { db } = require('./firebase');
 
 const app = express();
+
+// Aumenta o limite do body parser para aceitar payloads grandes (ex: 20mb)
+app.use(cors());
+app.use(bodyParser.json({ limit: '20mb' }));
+app.use(bodyParser.urlencoded({ extended: true, limit: '20mb' }));
+
 const PORT = process.env.PORT || 3001;
 const NGROK_AUTHTOKEN = process.env.NGROK_AUTHTOKEN || '1oqB3iP42FXti1LBFru5iA0KMoL_3L1XTqcUwsjXbccgXYxdz';
 
@@ -41,7 +48,8 @@ app.use((req, res, next) => {
 });
 
 app.get('/api/ngrok-url', (req, res) => {
-  res.json({ url: NGROK.url });
+  const ngrokUrl = req.app.locals.ngrokUrl || 'http://localhost:3001';
+  res.json({ url: ngrokUrl });
 });
 
 app.get('/api/ngrok-debug', (req, res) => {
