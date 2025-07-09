@@ -264,8 +264,8 @@ router.get('/contas', async (req, res) => {
 });
 
 /**
- * ROTA OTIMIZADA: Lê as vendas diretamente do cache do Firestore.
- * Esta rota será rápida e usada pelo frontend para popular a tabela.
+ * ROTA DE CACHE: Lê as vendas JÁ SALVAS no Firestore.
+ * Usada para popular a tabela instantaneamente com dados antigos.
  */
 router.get('/vendas', async (req, res) => {
     const { uid } = req.query;
@@ -275,149 +275,210 @@ router.get('/vendas', async (req, res) => {
     try {
         const snapshot = await db.collection('users').doc(uid).collection('mlVendas').orderBy('date_created', 'desc').get();
         const todasAsVendas = snapshot.docs.map(doc => doc.data());
-        console.log(`[ML Firestore Read] Retornando ${todasAsVendas.length} vendas do Firestore para o UID ${uid}.`);
+        console.log(`[ML Cache Read] Retornando ${todasAsVendas.length} vendas do Firestore para o UID ${uid}.`);
         res.json(todasAsVendas);
     } catch (error) {
-        console.error('[ML API] Erro ao buscar vendas do Firestore:', error.message);
+        console.error('[ML Cache Read] Erro ao buscar vendas do Firestore:', error.message);
         res.status(500).json({ error: 'Erro ao buscar vendas do cache', detalhe: error.message });
     }
 });
 
 /**
- * ROTA DE SINCRONIZAÇÃO: Inicia a busca completa das vendas e salva no Firestore.
- * Esta rota agora realiza a lógica de paginação e salvamento que antes estava em /vendas.
+ * NOVA ROTA DE LISTA: Busca TODAS as vendas da API do ML com paginação PARA TODAS AS CONTAS.
+ * Não salva nada, apenas retorna a lista completa para o frontend orquestrar.
  */
-router.get('/vendas/sync', async (req, res) => {
+router.get('/vendas/list', async (req, res) => {
     const { uid } = req.query;
     if (!uid) {
-      return res.status(400).json({ error: 'UID obrigatório' });
+        return res.status(400).json({ error: 'UID obrigatório' });
     }
 
-    // Responde imediatamente ao cliente para que ele não fique esperando
-    res.json({ success: true, message: 'Sincronização iniciada em segundo plano.' });
-
-    // --- O restante da função executa em segundo plano ---
-    console.log(`[ML Sync] Sincronização em segundo plano iniciada para o UID: ${uid}`);
     try {
-      const contasSnap = await db.collection('users').doc(uid).collection('mercadoLivre').get();
-      if (contasSnap.empty) {
-        console.log(`[ML Sync] Nenhuma conta ML para sincronizar para o UID: ${uid}`);
-        return;
-      }
-  
-      for (const docConta of contasSnap.docs) {
-        const contaId = docConta.id;
-        try {
-            const access_token = await getValidTokenML(uid, contaId);
-            const user_id = docConta.data().user_id;
-            let offset = 0;
-            const limit = 50;
-            let totalSincronizadas = 0;
-
-            while (true) {
-                const url = `https://api.mercadolibre.com/orders/search?seller=${user_id}&order.status=paid&sort=date_desc&offset=${offset}&limit=${limit}`;
-                const vendasRes = await fetch(url, { headers: { Authorization: `Bearer ${access_token}` } });
-                
-                if (!vendasRes.ok) {
-                    console.error(`[ML Sync] Erro ao buscar lista de vendas para conta ${user_id}. Status: ${vendasRes.status}`);
-                    break;
-                }
-
-                const vendasData = await vendasRes.json();
-                if (!vendasData.results || vendasData.results.length === 0) {
-                    break; // Fim das vendas
-                }
-                
-                // Pula o salvamento de placeholders se a venda já existir com dados completos
-                const existingVendasSnap = await db.collection('users').doc(uid).collection('mlVendas')
-                  .where('id', 'in', vendasData.results.map(v => v.id))
-                  .get();
-                const existingVendasIds = new Set(existingVendasSnap.docs.map(doc => doc.data().id.toString()));
-
-                const newVendas = vendasData.results.filter(venda => !existingVendasIds.has(venda.id.toString()));
-
-                if (newVendas.length > 0) {
-                    // Salva placeholders primeiro para dar feedback visual rápido no frontend
-                    const placeholders = newVendas.map(venda => {
-                        const orderId = venda.id.toString();
-                        const vendaDocRef = db.collection('users').doc(uid).collection('mlVendas').doc(orderId);
-                        return vendaDocRef.set({ 
-                            id: orderId, 
-                            status: 'syncing', // Status para o frontend identificar o loader
-                            date_created: venda.date_created, // Data para ordenação
-                            placeholder: true 
-                        }, { merge: true });
-                    });
-                    await Promise.all(placeholders);
-                }
-
-
-                // Agora, busca os detalhes completos e atualiza cada venda
-                await Promise.all(vendasData.results.map(async (venda) => {
-                    const orderId = venda.id.toString();
-                    const vendaDocRef = db.collection('users').doc(uid).collection('mlVendas').doc(orderId);
-
-                    const detailsRes = await fetch(`https://api.mercadolibre.com/orders/${orderId}`, { headers: { Authorization: `Bearer ${access_token}` } });
-                    if (!detailsRes.ok) {
-                        console.warn(`[ML Sync] Falha ao buscar detalhes do pedido ${orderId}.`);
-                        await vendaDocRef.update({ status: 'sync_error', status_detail: 'Falha ao buscar detalhes' });
-                        return;
-                    }
-                    const orderDetails = await detailsRes.json();
-                    
-                    let shipmentDetails = {};
-                    if (orderDetails.shipping?.id) {
-                        const shipmentRes = await fetch(`https://api.mercadolibre.com/shipments/${orderDetails.shipping.id}`, { headers: { Authorization: `Bearer ${access_token}` } });
-                        if(shipmentRes.ok) shipmentDetails = await shipmentRes.json();
-                    }
-
-                    await vendaDocRef.set({ ...orderDetails, shipping: shipmentDetails, updatedAt: new Date().toISOString() }, { merge: true });
-                    console.log(`[ML Sync] Venda ${orderId} salva/atualizada no Firestore.`);
-                    totalSincronizadas++;
-                }));
-
-                offset += limit;
-            }
-            console.log(`[ML Sync] Sincronização concluída para a conta ${contaId}. Total de ${totalSincronizadas} vendas processadas.`);
-        } catch (error) {
-            console.error(`[ML Sync] Falha ao processar vendas para a conta ${contaId}:`, error.message);
-            continue; // Continua para a próxima conta
+        const contasSnap = await db.collection('users').doc(uid).collection('mercadoLivre').get();
+        if (contasSnap.empty) {
+            return res.json({ results: [] });
         }
-      }
-      console.log(`[ML Sync] Processo de sincronização em segundo plano finalizado para o UID: ${uid}`);
+
+        let allResults = [];
+        
+        // Itera sobre todas as contas conectadas
+        for (const contaDoc of contasSnap.docs) {
+            const contaData = contaDoc.data();
+            const contaId = contaDoc.id;
+            const user_id = contaData.user_id;
+
+            console.log(`[ML List] Iniciando busca de vendas para a conta: ${contaData.nickname} (${user_id})`);
+            
+            try {
+                const access_token = await getValidTokenML(uid, contaId);
+                let offset = 0;
+                const limit = 50;
+
+                while (true) {
+                    const url = `https://api.mercadolibre.com/orders/search?seller=${user_id}&order.status=paid&sort=date_desc&offset=${offset}&limit=${limit}`;
+                    const vendasRes = await fetch(url, { headers: { Authorization: `Bearer ${access_token}` } });
+
+                    if (!vendasRes.ok) {
+                        const errorData = await vendasRes.json();
+                        console.error(`[ML List] Erro na API do ML para a conta ${user_id}:`, errorData.message);
+                        break; // Pula para a próxima conta em caso de erro
+                    }
+
+                    const vendasData = await vendasRes.json();
+                    
+                    if (vendasData.results && vendasData.results.length > 0) {
+                        // Adiciona o ID do vendedor em cada venda para identificação no frontend
+                        const vendasComSeller = vendasData.results.map(v => ({
+                            ...v,
+                            seller_account_id: user_id 
+                        }));
+                        allResults.push(...vendasComSeller);
+                        offset += limit;
+                        console.log(`[ML List] Conta ${user_id}: Página ${offset / limit} buscada. Total de vendas até agora: ${allResults.length}`);
+                    } else {
+                        break;
+                    }
+                }
+            } catch (contaError) {
+                console.error(`[ML List] Erro ao processar a conta ${contaData.nickname}:`, contaError.message);
+                continue; // Pula para a próxima conta
+            }
+        }
+        
+        console.log(`[ML List] Busca finalizada. Retornando lista de ${allResults.length} vendas de todas as contas para o frontend.`);
+        res.json({ results: allResults });
+
     } catch (error) {
-      console.error('[ML Sync] Erro fatal no processo de sincronização:', error.message);
+        console.error('[ML List] Erro geral ao buscar lista de vendas:', error);
+        res.status(500).json({ error: 'Erro ao buscar lista de vendas', detalhe: error.message });
+    }
+});
+
+/**
+ * NOVA FUNÇÃO ADICIONADA: Calcula o frete ajustado.
+ * @param {object} shippingDetails - O objeto de detalhes do frete da API do ML.
+ * @param {object} orderDetails - O objeto de detalhes do pedido da API do ML.
+ * @returns {number} O valor do frete ajustado.
+ */
+function calcularFreteAdjust(shippingDetails, orderDetails) {
+    const logisticType = (shippingDetails?.logistic_type || '').toString();
+    const orderCost = Number(orderDetails?.total_amount) || 0;
+    const baseCost = Number(shippingDetails?.base_cost) || 0;
+    const listCost = Number(shippingDetails?.list_cost) || 0;
+    const shippingCost = Number(shippingDetails?.cost) || 0;
+
+    let result = 999;
+
+    if (logisticType === 'self_service') {
+        if (orderCost < 79) {
+            result = baseCost;
+        } else {
+            result = baseCost - listCost;
+        }
+    } else if (['drop_off', 'xd_drop_off'].includes(logisticType)) {
+        result = listCost - shippingCost;
+    } else if (['fulfillment', 'cross_docking'].includes(logisticType)) {
+        result = listCost;
+    }
+
+    const multiplier = (logisticType === 'self_service') ? 1 : -1;
+    return result * multiplier;
+}
+
+/**
+ * NOVA ROTA DE DETALHE: Busca detalhes de UMA venda, salva no Firestore e retorna.
+ * Agora usa o sellerId para pegar o token da conta correta.
+ * **MODIFICADO**: Adiciona o campo `frete_adjust` antes de salvar.
+ */
+router.get('/vendas/detail/:orderId', async (req, res) => {
+    const { uid, sellerId } = req.query;
+    const { orderId } = req.params;
+    if (!uid || !orderId || !sellerId) {
+        return res.status(400).json({ error: 'UID, Order ID e Seller ID são obrigatórios' });
+    }
+
+    try {
+        // Usa o sellerId para obter o token da conta correta
+        const access_token = await getValidTokenML(uid, sellerId.toString());
+
+        const detailsRes = await fetch(`https://api.mercadolibre.com/orders/${orderId}`, { headers: { Authorization: `Bearer ${access_token}` } });
+        if (!detailsRes.ok) {
+            throw new Error(`Falha ao buscar detalhes do pedido ${orderId}`);
+        }
+        
+        const orderDetails = await detailsRes.json();
+        
+        let shipmentDetails = {};
+        if (orderDetails.shipping?.id) {
+            const shipmentRes = await fetch(`https://api.mercadolibre.com/shipments/${orderDetails.shipping.id}`, { headers: { Authorization: `Bearer ${access_token}` } });
+            if (shipmentRes.ok) {
+                shipmentDetails = await shipmentRes.json();
+            }
+        }
+        
+        const finalData = { 
+            ...orderDetails, 
+            shipping_details: shipmentDetails, 
+            updatedAt: new Date().toISOString() 
+        };
+        
+        // *** NOVA LINHA: Adiciona o campo calculado ***
+        finalData.frete_adjust = calcularFreteAdjust(shipmentDetails, orderDetails);
+
+        const vendaDocRef = db.collection('users').doc(uid).collection('mlVendas').doc(orderId);
+        await vendaDocRef.set(finalData, { merge: true });
+        
+        console.log(`[ML Detail] Detalhes da venda ${orderId} (Vendedor: ${sellerId}) salvos com frete_adjust: ${finalData.frete_adjust}.`);
+        res.json(finalData);
+
+    } catch (error) {
+        console.error(`[ML Detail] Erro ao processar venda ${orderId}:`, error);
+        res.status(500).json({ error: `Erro ao processar venda ${orderId}`, detalhe: error.message });
     }
 });
   
-router.delete('/vendas', async (req, res) => {
+async function deleteCollectionBatch(db, collectionRef, batchSize) {
+    const query = collectionRef.limit(batchSize);
+    let deletedCount = 0;
+
+    while (true) {
+        const snapshot = await query.get();
+        if (snapshot.size === 0) {
+            break; 
+        }
+
+        const batch = db.batch();
+        snapshot.docs.forEach(doc => {
+            batch.delete(doc.ref);
+        });
+        await batch.commit();
+
+        deletedCount += snapshot.size;
+        console.log(`[ML Delete] Lote de ${snapshot.size} vendas excluído.`);
+    }
+    return deletedCount;
+}
+
+router.delete('/vendas', (req, res) => {
     const uid = req.query.uid || req.body.uid;
     if (!uid) {
-      return res.status(400).json({ error: 'UID obrigatório' });
+        return res.status(400).json({ error: 'UID obrigatório' });
     }
-    try {
-      const vendasRef = db.collection('users').doc(uid).collection('mlVendas');
-      const snapshot = await vendasRef.limit(500).get();
-      
-      if (snapshot.empty) {
-        return res.json({ success: true, deleted: 0, message: "Nenhuma venda para excluir." });
-      }
-      
-      const batch = db.batch();
-      snapshot.docs.forEach(doc => {
-        batch.delete(doc.ref);
-      });
-      await batch.commit();
-      
-      // Para exclusão em massa, um processo em segundo plano ou fila seria mais robusto.
-      // Esta implementação exclui até 500 por vez.
-      console.log(`[ML Delete] ${snapshot.size} vendas excluídas para o UID ${uid}`);
-      res.json({ success: true, deleted: snapshot.size });
 
-    } catch (err) {
-      console.error('[ML Delete] Erro ao excluir vendas:', err);
-      res.status(500).json({ error: 'Erro ao excluir vendas do Mercado Livre', detalhe: err.message });
-    }
+    // Responde imediatamente para o frontend
+    res.json({ success: true, message: "A exclusão foi iniciada em segundo plano." });
+
+    // Inicia o processo de exclusão em segundo plano
+    console.log(`[ML Delete] Iniciando exclusão em segundo plano para UID: ${uid}`);
+    const vendasRef = db.collection('users').doc(uid).collection('mlVendas');
+    
+    deleteCollectionBatch(db, vendasRef, 200)
+        .then(deletedCount => {
+            console.log(`[ML Delete] Processo em segundo plano CONCLUÍDO. ${deletedCount} vendas excluídas para o UID ${uid}`);
+        })
+        .catch(err => {
+            console.error(`[ML Delete] Erro FATAL no processo de exclusão em segundo plano para UID ${uid}:`, err);
+        });
 });
   
 router.post('/vendas/fake', async (req, res) => {
