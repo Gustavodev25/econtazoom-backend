@@ -8,6 +8,27 @@ const CLIENT_ID = process.env.SHOPEE_CLIENT_ID || '2011938';
 const CLIENT_SECRET = process.env.SHOPEE_CLIENT_SECRET || 'shpk527477684f57526b554d567743746d766e51795778465974447565734c52';
 const SHOPEE_BASE_URL = 'https://openplatform.shopee.com.br';
 
+/**
+ * Função auxiliar para obter a URI de redirecionamento correta com base no ambiente.
+ * Pega como base a lógica do arquivo mercadoLivre.js.
+ * @param {object} req - O objeto de requisição do Express para acessar o ngrokUrl em desenvolvimento.
+ * @returns {string} A URL de callback completa.
+ */
+function getRedirectUri(req) {
+    // Em produção, usa a URL fixa do Render.
+    if (process.env.NODE_ENV === 'production') {
+        return 'https://econtazoom-backend.onrender.com/shopee/callback';
+    }
+    // Em desenvolvimento, usa a URL do ngrok.
+    const backendUrl = req.app.locals.ngrokUrl;
+    if (!backendUrl) {
+        // Lança um erro se estiver em desenvolvimento mas a URL do ngrok não estiver disponível.
+        throw new Error('URL de redirecionamento (Ngrok) não criada ou não encontrada.');
+    }
+    return `${backendUrl}/shopee/callback`;
+}
+
+
 function generateSign(path, partner_id, timestamp, access_token = '', shop_id = '') {
     const baseString = `${partner_id}${path}${timestamp}${access_token}${shop_id}`;
     return crypto.createHmac('sha256', CLIENT_SECRET).update(baseString).digest('hex');
@@ -106,21 +127,34 @@ async function getValidTokenShopee(uid, shopId, retryCount = 0) {
 
 router.get('/auth', (req, res) => {
     const { uid } = req.query;
-    if (!uid) return res.status(400).send('UID do usuário é obrigatório.');
-    const backendUrl = req.app.locals.ngrokUrl;
-    if (!backendUrl) return res.status(500).send('Erro no servidor: URL de redirecionamento não criada.');
-    const redirectUri = `${backendUrl}/shopee/callback`;
-    const finalRedirectUri = `${redirectUri}?uid=${uid}`;
-    const timestamp = Math.floor(Date.now() / 1000);
-    const path = '/api/v2/shop/auth_partner';
-    const sign = generateSign(path, CLIENT_ID, timestamp);
-    const authUrl = new URL(`${SHOPEE_BASE_URL}${path}`);
-    authUrl.searchParams.append('partner_id', CLIENT_ID);
-    authUrl.searchParams.append('timestamp', timestamp);
-    authUrl.searchParams.append('sign', sign);
-    authUrl.searchParams.append('redirect', finalRedirectUri);
-    res.redirect(authUrl.toString());
+    if (!uid) {
+        return res.status(400).send('UID do usuário é obrigatório.');
+    }
+    
+    try {
+        // Utiliza a nova função para obter a URL de callback correta
+        const redirectUri = getRedirectUri(req);
+        
+        const finalRedirectUri = `${redirectUri}?uid=${uid}`;
+        const timestamp = Math.floor(Date.now() / 1000);
+        const path = '/api/v2/shop/auth_partner';
+        const sign = generateSign(path, CLIENT_ID, timestamp);
+        
+        const authUrl = new URL(`${SHOPEE_BASE_URL}${path}`);
+        authUrl.searchParams.append('partner_id', CLIENT_ID);
+        authUrl.searchParams.append('timestamp', timestamp);
+        authUrl.searchParams.append('sign', sign);
+        authUrl.searchParams.append('redirect', finalRedirectUri);
+        
+        res.redirect(authUrl.toString());
+
+    } catch (error) {
+        // Captura o erro que pode ser lançado por getRedirectUri se o ngrok não estiver pronto
+        console.error('[Shopee Auth] Erro ao construir URL de autenticação:', error.message);
+        res.status(500).send(`Erro no servidor: ${error.message}`);
+    }
 });
+
 
 router.get('/callback', async (req, res) => {
     const { code, shop_id, uid } = req.query;
@@ -147,7 +181,7 @@ router.get('/callback', async (req, res) => {
         });
 
         if (shopInfoResponse.data.error) throw new Error('Falha ao obter os detalhes da loja.');
-        const { shop_name, region } = shopInfoResponse.data;
+        const { shop_name, region } = shopInfoResponse.data.response; // Correção: A resposta está em 'response'
 
         await db.collection('users').doc(uid).collection('shopee').doc(shop_id).set({
             access_token, refresh_token, expire_in, shop_id, status: 'ativo',
@@ -351,7 +385,6 @@ router.get('/vendas/detail/:orderSn', async (req, res) => {
             };
             const escrowResponse = await axios.get(`${SHOPEE_BASE_URL}${escrowPath}`, { params: escrowParams });
             
-            // CORREÇÃO: A resposta não é uma lista, é um objeto direto.
             if (!escrowResponse.data.error && escrowResponse.data.response) {
                 escrow_detail = escrowResponse.data.response;
                 console.log(`[Shopee Detail] Detalhes financeiros (escrow) obtidos para o pedido ${orderSn}.`);
@@ -371,7 +404,6 @@ router.get('/vendas/detail/:orderSn', async (req, res) => {
 
         if (escrow_detail && escrow_detail.order_income) {
             const income = escrow_detail.order_income;
-            // Soma todas as taxas relevantes que são custos para o vendedor
             totalFees = (income.commission_fee || 0) + 
                         (income.service_fee || 0) + 
                         (income.seller_transaction_fee || 0) +
@@ -379,7 +411,6 @@ router.get('/vendas/detail/:orderSn', async (req, res) => {
                         (income.escrow_tax || 0);
             netIncome = parseFloat(income.escrow_amount || 0);
         } else {
-            // Fallback para cálculo antigo se o escrow falhar
             const commissionFee = productSubtotal * 0.185;
             const transactionFee = 3.51;
             const serviceFee = 4.00;
@@ -389,7 +420,7 @@ router.get('/vendas/detail/:orderSn', async (req, res) => {
 
         const venda = {
             ...order,
-            escrow_detail, // Salva o objeto de escrow completo
+            escrow_detail,
             cliente: clienteFinal,
             nomeProdutoVendido: order.item_list[0]?.item_name || '-',
             productSubtotal,
@@ -473,7 +504,7 @@ async function validarECorrigirVenda(uid, venda) {
         camposCorrigidos.cliente = nomeCorrigido;
     }
 
-    if (Object.keys(camposCorrigidos).length > 0) {
+    if (Object.keys(camposCorrigidos).length > 0 && venda.idVendaMarketplace) {
         await vendasRef.doc(venda.idVendaMarketplace).set(camposCorrigidos, { merge: true });
         console.log(`[Shopee Correção] Venda ${venda.idVendaMarketplace} corrigida com os campos:`, camposCorrigidos);
     }
