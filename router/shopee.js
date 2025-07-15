@@ -4,25 +4,35 @@ const crypto = require('crypto');
 const axios = require('axios');
 const { db } = require('../firebase');
 
-const CLIENT_ID = process.env.SHOPEE_CLIENT_ID || '2011938';
-const CLIENT_SECRET = process.env.SHOPEE_CLIENT_SECRET || 'shpk527477684f57526b554d567743746d766e51795778465974447565734c52';
+// --- SELEÇÃO DE CREDENCIAIS BASEADO NO AMBIENTE ---
+let CLIENT_ID;
+let CLIENT_SECRET;
+
+const isProduction = process.env.NODE_ENV === 'production';
+
+if (isProduction) {
+    // Credenciais de Produção (Live)
+    CLIENT_ID = process.env.SHOPEE_LIVE_CLIENT_ID || '2011938';
+    CLIENT_SECRET = process.env.SHOPEE_LIVE_CLIENT_SECRET || 'shpk527477684f57526b554d567743746d766e51795778465974447565734c52';
+    console.log('[Shopee Auth] Rodando em modo de Produção (Live).');
+} else {
+    // Credenciais de Desenvolvimento (Test)
+    CLIENT_ID = process.env.SHOPEE_TEST_CLIENT_ID || '1280873';
+    CLIENT_SECRET = process.env.SHOPEE_TEST_CLIENT_SECRET || 'shpk4a58615665505042796e47536251497a784c7275746f566a6178546a6143';
+    console.log('[Shopee Auth] Rodando em modo de Desenvolvimento (Test).');
+}
+
 const SHOPEE_BASE_URL = 'https://openplatform.shopee.com.br';
 
 /**
  * Função auxiliar para obter a URI de redirecionamento correta com base no ambiente.
- * Pega como base a lógica do arquivo mercadoLivre.js.
- * @param {object} req - O objeto de requisição do Express para acessar o ngrokUrl em desenvolvimento.
- * @returns {string} A URL de callback completa.
  */
 function getRedirectUri(req) {
-    // Em produção, usa a URL fixa do Render.
-    if (process.env.NODE_ENV === 'production') {
+    if (isProduction) {
         return 'https://econtazoom-backend.onrender.com/shopee/callback';
     }
-    // Em desenvolvimento, usa a URL do ngrok.
     const backendUrl = req.app.locals.ngrokUrl;
     if (!backendUrl) {
-        // Lança um erro se estiver em desenvolvimento mas a URL do ngrok não estiver disponível.
         throw new Error('URL de redirecionamento (Ngrok) não criada ou não encontrada.');
     }
     return `${backendUrl}/shopee/callback`;
@@ -132,7 +142,6 @@ router.get('/auth', (req, res) => {
     }
     
     try {
-        // Utiliza a nova função para obter a URL de callback correta
         const redirectUri = getRedirectUri(req);
         
         const finalRedirectUri = `${redirectUri}?uid=${uid}`;
@@ -146,10 +155,10 @@ router.get('/auth', (req, res) => {
         authUrl.searchParams.append('sign', sign);
         authUrl.searchParams.append('redirect', finalRedirectUri);
         
+        console.log(`[Shopee Auth] Redirecionando para autenticação com Partner ID: ${CLIENT_ID}`);
         res.redirect(authUrl.toString());
 
     } catch (error) {
-        // Captura o erro que pode ser lançado por getRedirectUri se o ngrok não estiver pronto
         console.error('[Shopee Auth] Erro ao construir URL de autenticação:', error.message);
         res.status(500).send(`Erro no servidor: ${error.message}`);
     }
@@ -181,7 +190,7 @@ router.get('/callback', async (req, res) => {
         });
 
         if (shopInfoResponse.data.error) throw new Error('Falha ao obter os detalhes da loja.');
-        const { shop_name, region } = shopInfoResponse.data.response; // Correção: A resposta está em 'response'
+        const { shop_name, region } = shopInfoResponse.data.response;
 
         await db.collection('users').doc(uid).collection('shopee').doc(shop_id).set({
             access_token, refresh_token, expire_in, shop_id, status: 'ativo',
@@ -195,7 +204,9 @@ router.get('/callback', async (req, res) => {
     }
 });
 
-// NOVA ROTA PARA VERIFICAR O STATUS DA CONEXÃO
+// O restante do arquivo (rotas /contas, /vendas/list, etc.) permanece o mesmo.
+// Cole o resto do seu arquivo original aqui, se houver mais rotas.
+// ... (cole o resto do seu arquivo aqui)
 router.get('/contas', async (req, res) => {
     const { uid } = req.query;
     if (!uid) {
@@ -511,5 +522,6 @@ async function validarECorrigirVenda(uid, venda) {
     
     return camposCorrigidos;
 }
+
 
 module.exports = router;
