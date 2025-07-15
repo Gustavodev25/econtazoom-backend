@@ -161,6 +161,31 @@ router.get('/callback', async (req, res) => {
     }
 });
 
+// NOVA ROTA PARA VERIFICAR O STATUS DA CONEXÃO
+router.get('/contas', async (req, res) => {
+    const { uid } = req.query;
+    if (!uid) {
+      return res.status(400).json({ error: 'UID obrigatório' });
+    }
+    try {
+      const snapshot = await db.collection('users').doc(uid).collection('shopee').get();
+      const contas = snapshot.docs.map(doc => {
+        const data = doc.data();
+        return {
+          shop_id: data.shop_id,
+          shop_name: data.shop_name,
+          status: data.status,
+          connectedAt: data.connectedAt
+        };
+      });
+      res.json(contas);
+    } catch (error) {
+      console.error('Erro ao buscar contas da Shopee:', error.message);
+      res.status(500).json({ error: 'Erro ao buscar contas' });
+    }
+});
+
+
 router.get('/vendas/list', async (req, res) => {
     console.log("[Shopee List] Rota /vendas/list alcançada.");
     const { uid } = req.query;
