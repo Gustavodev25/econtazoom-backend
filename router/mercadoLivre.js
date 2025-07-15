@@ -2,7 +2,7 @@ const express = require('express');
 const fetch = (...args) => import('node-fetch').then(m => m.default(...args));
 const crypto = require('crypto');
 const router = express.Router();
-const { db } = require('../firebase'); // Importar o db corretamente
+const { db } = require('../'); // Importar o db corretamente
 
 const CLIENT_ID = '4762241412857004';
 const CLIENT_SECRET = 'yBJNREOR3izbhIGRJtUP8P4FsGNXLIvB';
