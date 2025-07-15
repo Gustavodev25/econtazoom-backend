@@ -355,9 +355,10 @@ router.get('/vendas/list', async (req, res) => {
 });
 
 /**
- * NOVA FUNÇÃO ADICIONADA: Calcula o frete ajustado.
- * @param {object} shippingDetails - O objeto de detalhes do frete da API do ML.
- * @param {object} orderDetails - O objeto de detalhes do pedido da API do ML.
+ * FUNÇÃO DE CÁLCULO DO FRETE AJUSTADO
+ * Implementa a lógica da consulta SQL fornecida.
+ * @param {object} shippingDetails - Detalhes do envio da API (shipments).
+ * @param {object} orderDetails - Detalhes do pedido da API (orders).
  * @returns {number} O valor do frete ajustado.
  */
 function calcularFreteAdjust(shippingDetails, orderDetails) {
@@ -367,7 +368,7 @@ function calcularFreteAdjust(shippingDetails, orderDetails) {
     const listCost = Number(shippingDetails?.list_cost) || 0;
     const shippingCost = Number(shippingDetails?.cost) || 0;
 
-    let result = 999;
+    let result = 999; 
 
     if (logisticType === 'self_service') {
         if (orderCost < 79) {
@@ -386,9 +387,8 @@ function calcularFreteAdjust(shippingDetails, orderDetails) {
 }
 
 /**
- * NOVA ROTA DE DETALHE: Busca detalhes de UMA venda, salva no Firestore e retorna.
- * Agora usa o sellerId para pegar o token da conta correta.
- * **MODIFICADO**: Adiciona o campo `frete_adjust` antes de salvar.
+ * ROTA DE DETALHE: Busca detalhes de UMA venda, salva no Firestore e retorna.
+ * Adiciona o campo `frete_adjust` antes de salvar.
  */
 router.get('/vendas/detail/:orderId', async (req, res) => {
     const { uid, sellerId } = req.query;
@@ -398,7 +398,6 @@ router.get('/vendas/detail/:orderId', async (req, res) => {
     }
 
     try {
-        // Usa o sellerId para obter o token da conta correta
         const access_token = await getValidTokenML(uid, sellerId.toString());
 
         const detailsRes = await fetch(`https://api.mercadolibre.com/orders/${orderId}`, { headers: { Authorization: `Bearer ${access_token}` } });
@@ -422,7 +421,7 @@ router.get('/vendas/detail/:orderId', async (req, res) => {
             updatedAt: new Date().toISOString() 
         };
         
-        // *** NOVA LINHA: Adiciona o campo calculado ***
+        // Adiciona o campo calculado usando a função
         finalData.frete_adjust = calcularFreteAdjust(shipmentDetails, orderDetails);
 
         const vendaDocRef = db.collection('users').doc(uid).collection('mlVendas').doc(orderId);
@@ -465,10 +464,8 @@ router.delete('/vendas', (req, res) => {
         return res.status(400).json({ error: 'UID obrigatório' });
     }
 
-    // Responde imediatamente para o frontend
     res.json({ success: true, message: "A exclusão foi iniciada em segundo plano." });
 
-    // Inicia o processo de exclusão em segundo plano
     console.log(`[ML Delete] Iniciando exclusão em segundo plano para UID: ${uid}`);
     const vendasRef = db.collection('users').doc(uid).collection('mlVendas');
     

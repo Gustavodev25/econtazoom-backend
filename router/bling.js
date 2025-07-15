@@ -2,13 +2,18 @@ const express = require('express');
 const axios = require('axios');
 const qs = require('querystring');
 const router = express.Router();
-const { db, admin } = require('../firebase'); // Ajuste o caminho se necessário
+const { db, admin } = require('../firebase');
+const multer = require('multer');
+
+// --- CONFIGURAÇÃO DE UPLOAD ---
+const storage = multer.memoryStorage();
+const upload = multer({ storage: storage });
 
 const BLING_CLIENT_ID = process.env.BLING_CLIENT_ID || '57f339b6be5fdc0d986c1170b709b8d82ece3a76';
 const BLING_CLIENT_SECRET = process.env.BLING_CLIENT_SECRET || '5f59f5f4610f20bfd74984f151bcca343cb1375d68cc27216c4b2bc8a97d';
 const BLING_SCOPES = process.env.BLING_SCOPES || 'vendas+contas+cadastros';
 
-// --- FUNÇÕES AUXILIARES DE AUTENTICAÇÃO E CONFIGURAÇÃO ---
+// --- FUNÇÕES AUXILIARES ---
 function getRedirectUri(req) {
     if (process.env.NODE_ENV === 'production' || !req.app.locals.ngrokUrl) {
         return 'https://econtazoom-backend.onrender.com/bling/callback';
@@ -23,12 +28,6 @@ function getFrontendUrl() {
     return 'http://localhost:8080/contas';
 }
 
-// --- NOVA FUNÇÃO AUXILIAR PARA NOMES DE COLEÇÃO ---
-/**
- * Retorna o nome da coleção do Firestore para um determinado tipo de dados do Bling.
- * @param {string} dataType - O tipo de dado (ex: 'contas-pagar', 'categorias').
- * @returns {string|null} O nome da coleção ou null se o tipo for inválido.
- */
 function getFirestoreCollectionName(dataType) {
     const map = {
         'contas-pagar': 'blingContasPagar',
@@ -38,7 +37,6 @@ function getFirestoreCollectionName(dataType) {
     };
     return map[dataType] || null;
 }
-
 
 async function refreshToken(bling, uid) {
     try {
@@ -102,11 +100,9 @@ async function processBlingQueue() {
                 ...config,
                 headers: { ...config.headers, Authorization: `Bearer ${accessToken}`, 'Accept': 'application/json' }
             };
-            console.log(`[Bling Queue] Attempting to request: '${url}' (ID: ${debugId})`);
             const response = await axios.get(url, fullConfig);
             resolve(response);
         } catch (error) {
-            console.error(`[Bling Queue] Erro na requisição para '${url}' (ID: ${debugId}):`, error.response?.data || error.message);
             reject(error);
         }
     }
@@ -122,7 +118,31 @@ async function makeBlingRequestQueued(url, config, accessToken, debugId) {
     });
 }
 
-// --- ROTAS DE AUTENTICAÇÃO (sem alterações) ---
+async function uploadFileToStorage(file, uid) {
+    const bucket = admin.storage().bucket();
+    const fileName = `comprovantes/${uid}/${Date.now()}_${file.originalname.replace(/\s/g, '_')}`;
+    const fileUpload = bucket.file(fileName);
+    const blobStream = fileUpload.createWriteStream({
+        metadata: {
+            contentType: file.mimetype
+        }
+    });
+    return new Promise((resolve, reject) => {
+        blobStream.on('error', (error) => reject('Algo deu errado ao fazer upload do arquivo.'));
+        blobStream.on('finish', async () => {
+            try {
+                await fileUpload.makePublic();
+                const publicUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
+                resolve(publicUrl);
+            } catch (error) {
+                reject('Erro ao obter a URL pública do arquivo.');
+            }
+        });
+        blobStream.end(file.buffer);
+    });
+}
+
+// --- ROTAS DE AUTENTICAÇÃO BLING ---
 router.get('/auth', (req, res) => {
     const { uid } = req.query;
     if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
@@ -131,6 +151,7 @@ router.get('/auth', (req, res) => {
     const url = `https://www.bling.com.br/Api/v3/oauth/authorize?response_type=code&client_id=${BLING_CLIENT_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}&scope=${BLING_SCOPES}`;
     res.redirect(url);
 });
+
 router.get('/callback', async (req, res) => {
     const { code, state } = req.query;
     if (!code || !state) return res.status(400).json({ error: 'Code e state obrigatórios' });
@@ -153,6 +174,7 @@ router.get('/callback', async (req, res) => {
         res.redirect(getFrontendUrl() + `?bling=error&msg=${encodeURIComponent(err.response?.data?.error_description || err.message || 'Erro desconhecido')}`);
     }
 });
+
 router.post('/logout', async (req, res) => {
     const { uid } = req.body;
     if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
@@ -163,6 +185,7 @@ router.post('/logout', async (req, res) => {
         res.status(500).json({ error: 'Erro ao remover conta Bling' });
     }
 });
+
 router.get('/status', async (req, res) => {
     const { uid } = req.query;
     if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
@@ -171,293 +194,196 @@ router.get('/status', async (req, res) => {
     res.json({ connected: !!bling, bling });
 });
 
-// --- ROTAS DE LISTAGEM DO BLING (MODIFICADAS PARA FILTRAR POR PERÍODO FIXO) ---
-router.get('/contas-pagar', async (req, res) => {
-    const { uid } = req.query;
-    if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
-    try {
-        const accessToken = await getValidToken(uid);
-        // Remover limitador de 100 e buscar até 1941 registros
-        const params = {
-            ...req.query,
-            dataPagamentoInicial: '2025-01-01',
-            dataPagamentoFinal: '2025-06-30',
-            limit: 1941 // Bling aceita o parâmetro 'limit'
-        };
-        const listUrl = 'https://www.bling.com.br/Api/v3/contas/pagar'.trim();
-        const listResponse = await makeBlingRequestQueued(listUrl, { params }, accessToken, 'list-contas-pagar');
-        res.json({ data: listResponse.data?.data });
-    } catch (err) {
-        res.status(500).json({ error: err.response?.data?.error_description || err.message || 'Erro ao buscar lista de contas a pagar' });
-    }
-});
-
-router.get('/contas-receber', async (req, res) => {
-    const { uid } = req.query;
-    if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
-    try {
-        const accessToken = await getValidToken(uid);
-        const params = {
-            ...req.query,
-            dataPagamentoInicial: '2025-01-01',
-            dataPagamentoFinal: '2025-06-30'
-        };
-        const listUrl = 'https://www.bling.com.br/Api/v3/contas/receber'.trim();
-        const listResponse = await makeBlingRequestQueued(listUrl, { params }, accessToken, 'list-contas-receber');
-        res.json({ data: listResponse.data?.data });
-    } catch (err) {
-        res.status(500).json({ error: err.response?.data?.error_description || err.message || 'Erro ao buscar lista de contas a receber' });
-    }
-});
-
-// Adicione o filtro de período para categorias e formas de pagamento, se a API aceitar parâmetros de data
-router.get('/categorias/receitas-despesas', async (req, res) => {
-    const { uid } = req.query;
-    if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
-    try {
-        const accessToken = await getValidToken(uid);
-        // Adiciona filtro de período se a API do Bling aceitar (caso contrário, não faz mal)
-        const params = {
-            ...req.query,
-            dataInicial: '2025-01-01',
-            dataFinal: '2025-06-30'
-        };
-        const listUrl = 'https://www.bling.com.br/Api/v3/categorias/receitas-despesas'.trim();
-        const listResponse = await makeBlingRequestQueued(listUrl, { params }, accessToken, 'list-categorias');
-        res.json({ data: listResponse.data?.data });
-    } catch (err) {
-        res.status(500).json({ error: err.response?.data?.error_description || err.message || 'Erro ao buscar categorias' });
-    }
-});
-
-router.get('/formas-pagamentos', async (req, res) => {
-    const { uid } = req.query;
-    if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
-    try {
-        const accessToken = await getValidToken(uid);
-        // Adiciona filtro de período se a API do Bling aceitar (caso contrário, não faz mal)
-        const params = {
-            ...req.query,
-            dataInicial: '2025-01-01',
-            dataFinal: '2025-06-30'
-        };
-        const listUrl = 'https://www.bling.com.br/Api/v3/formas-pagamentos'.trim();
-        const listResponse = await makeBlingRequestQueued(listUrl, { params }, accessToken, 'list-formas-pagamento');
-        res.json({ data: listResponse.data?.data });
-    } catch (err) {
-        res.status(500).json({ error: err.response?.data?.error_description || err.message || 'Erro ao buscar formas de pagamento' });
-    }
-});
-
-// --- ROTAS DE DETALHES DO BLING (SALVAM NO FIRESTORE, SEM ALTERAÇÃO) ---
-
-router.get('/contas-pagar-detalhe/:id', async (req, res) => {
-    const { uid } = req.query;
-    const { id } = req.params;
-    if (!uid || !id) return res.status(400).json({ error: 'UID e ID da conta são obrigatórios' });
-    try {
-        const accessToken = await getValidToken(uid);
-        const detailUrl = `https://www.bling.com.br/Api/v3/contas/pagar/${id}`.trim();
-        const detailResponse = await makeBlingRequestQueued(detailUrl, {}, accessToken, `detail-pagar-${id}`);
-        
-        const detailData = detailResponse.data?.data;
-        if (detailData) {
-            const collectionName = getFirestoreCollectionName('contas-pagar');
-            await db.collection('users').doc(uid).collection(collectionName).doc(String(id)).set(detailData, { merge: true });
-        }
-
-        res.json({ data: detailData });
-    } catch (err) {
-        if (err.response?.status === 429) {
-             return res.status(429).json({ error: 'Limite de requisições Bling atingido.', details: err.response.data });
-        }
-        res.status(500).json({ error: err.response?.data?.error_description || err.message || 'Erro ao buscar detalhes da conta a pagar' });
-    }
-});
-
-router.get('/contas-receber-detalhe/:id', async (req, res) => {
-    const { uid } = req.query;
-    const { id } = req.params;
-    if (!uid || !id) return res.status(400).json({ error: 'UID e ID da conta são obrigatórios' });
-    try {
-        const accessToken = await getValidToken(uid);
-        const detailUrl = `https://www.bling.com.br/Api/v3/contas/receber/${id}`.trim();
-        const detailResponse = await makeBlingRequestQueued(detailUrl, {}, accessToken, `detail-receber-${id}`);
-
-        const detailData = detailResponse.data?.data;
-        if (detailData) {
-            const collectionName = getFirestoreCollectionName('contas-receber');
-            await db.collection('users').doc(uid).collection(collectionName).doc(String(id)).set(detailData, { merge: true });
-        }
-
-        res.json({ data: detailData });
-    } catch (err) {
-        if (err.response?.status === 429) {
-             return res.status(429).json({ error: 'Limite de requisições Bling atingido.', details: err.response.data });
-        }
-        res.status(500).json({ error: err.response?.data?.error_description || err.message || 'Erro ao buscar detalhes da conta a receber' });
-    }
-});
-
-router.get('/categorias/receitas-despesas/:idCategoria', async (req, res) => {
-    const { uid } = req.query;
-    const { idCategoria } = req.params;
-    if (!uid || !idCategoria) return res.status(400).json({ error: 'UID e ID da categoria são obrigatórios' });
-    try {
-        const accessToken = await getValidToken(uid);
-        const detailUrl = `https://www.bling.com.br/Api/v3/categorias/receitas-despesas/${idCategoria}`.trim();
-        const detailResponse = await makeBlingRequestQueued(detailUrl, {}, accessToken, `detail-categoria-${idCategoria}`);
-
-        const detailData = detailResponse.data?.data;
-        if (detailData) {
-            const collectionName = getFirestoreCollectionName('categorias');
-            await db.collection('users').doc(uid).collection(collectionName).doc(String(idCategoria)).set(detailData, { merge: true });
-        }
-
-        res.json({ data: detailData });
-    } catch (err) {
-        if (err.response?.status === 429) {
-             return res.status(429).json({ error: 'Limite de requisições Bling atingido.', details: err.response.data });
-        }
-        res.status(500).json({ error: err.response?.data?.error_description || err.message || 'Erro ao buscar detalhes da categoria' });
-    }
-});
-
-router.get('/formas-pagamentos/:idFormaPagamento', async (req, res) => {
-    const { uid } = req.query;
-    const { idFormaPagamento } = req.params;
-    if (!uid || !idFormaPagamento) return res.status(400).json({ error: 'UID e ID da forma de pagamento são obrigatórios' });
-    try {
-        const accessToken = await getValidToken(uid);
-        const detailUrl = `https://www.bling.com.br/Api/v3/formas-pagamentos/${idFormaPagamento}`.trim();
-        const detailResponse = await makeBlingRequestQueued(detailUrl, {}, accessToken, `detail-forma-pagamento-${idFormaPagamento}`);
-
-        const detailData = detailResponse.data?.data;
-        if (detailData) {
-            const collectionName = getFirestoreCollectionName('formas-pagamentos');
-            await db.collection('users').doc(uid).collection(collectionName).doc(String(idFormaPagamento)).set(detailData, { merge: true });
-        }
-
-        res.json({ data: detailData });
-    } catch (err) {
-        if (err.response?.status === 429) {
-             return res.status(429).json({ error: 'Limite de requisições Bling atingido.', details: err.response.data });
-        }
-        res.status(500).json({ error: err.response?.data?.error_description || err.message || 'Erro ao buscar detalhes da forma de pagamento' });
-    }
-});
-
-
-// --- NOVAS ROTAS PARA LER DADOS DO CACHE DO FIRESTORE ---
-
+// --- ROTA DE LEITURA DO CACHE FIRESTORE ---
 router.get('/firestore/:dataType', async (req, res) => {
     const { uid } = req.query;
     const { dataType } = req.params;
-
     if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
-    
     const collectionName = getFirestoreCollectionName(dataType);
     if (!collectionName) return res.status(400).json({ error: 'Tipo de dado inválido' });
-
     try {
         const snapshot = await db.collection('users').doc(uid).collection(collectionName).get();
-        if (snapshot.empty) {
-            return res.json({ data: [] });
-        }
         const data = snapshot.docs.map(doc => doc.data());
         res.json({ data });
     } catch (e) {
-        console.error(`[Firestore Cache] Erro ao ler cache para ${collectionName}:`, e);
         res.status(500).json({ error: 'Erro ao ler dados do cache do Firestore' });
     }
 });
 
-// NOVA ROTA PARA IMPORTAÇÃO DE CONTAS A PAGAR VIA EXCEL
-router.post('/firestore/contas-pagar/import', async (req, res) => {
-    const { uid, conta } = req.body;
-    if (!uid || !conta) return res.status(400).json({ error: 'UID e conta obrigatórios' });
-
-    // Gera um ID aleatório se não vier do frontend
-    let id = conta.id;
-    if (!id) {
-        id = 'excel_' + Date.now() + '_' + Math.floor(Math.random() * 1000000);
-        conta.id = id;
+// --- ROTAS DE CRUD PARA CATEGORIAS ---
+router.post('/firestore/categorias', async (req, res) => {
+    const { uid, categoria } = req.body;
+    if (!uid || !categoria || !categoria.descricao || !categoria.tipo) {
+        return res.status(400).json({ error: 'Dados incompletos.' });
     }
-
-    // Se vier categoria como string, salva também na coleção de categorias se ainda não existir
-    if (conta.categoria && typeof conta.categoria === 'string') {
-        const categoriaId = conta.categoria.trim();
-        if (categoriaId) {
-            const categoriaRef = db.collection('users').doc(uid).collection('blingCategorias').doc(categoriaId);
-            const catSnap = await categoriaRef.get();
-            if (!catSnap.exists) {
-                await categoriaRef.set({
-                    id: categoriaId,
-                    descricao: categoriaId,
-                    tipo: 1
-                }, { merge: true });
-            }
-            conta.categoria = { id: categoriaId, descricao: categoriaId, tipo: 1 };
-        }
-    }
-
     try {
-        await db.collection('users').doc(uid).collection('blingContasPagar').doc(String(id)).set(conta, { merge: true });
-        res.json({ success: true, id });
+        const id = 'manual_' + Date.now();
+        const novaCategoria = { id, descricao: categoria.descricao, tipo: parseInt(categoria.tipo, 10), origem: 'manual' };
+        await db.collection('users').doc(uid).collection('blingCategorias').doc(id).set(novaCategoria);
+        res.json({ success: true, data: novaCategoria });
     } catch (e) {
-        res.status(500).json({ error: 'Erro ao importar conta a pagar', details: e.message });
+        res.status(500).json({ error: 'Erro ao salvar categoria', details: e.message });
     }
 });
 
-// NOVA ROTA PARA IMPORTAÇÃO EM LOTE (IMPORTAR TODOS DE UMA VEZ)
+router.put('/firestore/categorias/:id', async (req, res) => {
+    const { uid, categoriaData } = req.body;
+    const { id } = req.params;
+    if (!uid || !categoriaData || !id) return res.status(400).json({ error: 'Dados incompletos.' });
+    try {
+        await db.collection('users').doc(uid).collection('blingCategorias').doc(id).update(categoriaData);
+        res.json({ success: true, data: { ...categoriaData, id } });
+    } catch (e) {
+        res.status(500).json({ error: 'Erro ao atualizar categoria', details: e.message });
+    }
+});
+
+router.delete('/firestore/categorias/:id', async (req, res) => {
+    const { uid } = req.body;
+    const { id } = req.params;
+    if (!uid || !id) return res.status(400).json({ error: 'Dados incompletos.' });
+    try {
+        await db.collection('users').doc(uid).collection('blingCategorias').doc(id).delete();
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: 'Erro ao excluir categoria', details: e.message });
+    }
+});
+
+// --- ROTAS DE CRUD PARA FORMAS DE PAGAMENTO ---
+router.post('/firestore/formas-pagamentos', async (req, res) => {
+    const { uid, formaPagamento } = req.body;
+    if (!uid || !formaPagamento || !formaPagamento.descricao) return res.status(400).json({ error: 'Dados incompletos.' });
+    try {
+        const id = 'manual_' + Date.now();
+        const novaForma = { id, descricao: formaPagamento.descricao, origem: 'manual' };
+        await db.collection('users').doc(uid).collection('blingFormasPagamentos').doc(id).set(novaForma);
+        res.json({ success: true, data: novaForma });
+    } catch (e) {
+        res.status(500).json({ error: 'Erro ao salvar forma de pagamento', details: e.message });
+    }
+});
+
+router.put('/firestore/formas-pagamentos/:id', async (req, res) => {
+    const { uid, formaPagamentoData } = req.body;
+    const { id } = req.params;
+    if (!uid || !formaPagamentoData || !id) return res.status(400).json({ error: 'Dados incompletos.' });
+    try {
+        await db.collection('users').doc(uid).collection('blingFormasPagamentos').doc(id).update(formaPagamentoData);
+        res.json({ success: true, data: { ...formaPagamentoData, id } });
+    } catch (e) {
+        res.status(500).json({ error: 'Erro ao atualizar forma de pagamento', details: e.message });
+    }
+});
+
+router.delete('/firestore/formas-pagamentos/:id', async (req, res) => {
+    const { uid } = req.body;
+    const { id } = req.params;
+    if (!uid || !id) return res.status(400).json({ error: 'Dados incompletos.' });
+    try {
+        await db.collection('users').doc(uid).collection('blingFormasPagamentos').doc(id).delete();
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: 'Erro ao excluir forma de pagamento', details: e.message });
+    }
+});
+
+// --- ROTAS DE CRUD PARA LANÇAMENTOS (CONTAS A PAGAR/RECEBER) ---
+const handleLancamento = (collectionName) => async (req, res) => {
+    const uid = req.get('uid');
+    const { id } = req.params;
+    const conta = JSON.parse(req.body.conta);
+
+    if (!uid || !conta) return res.status(400).json({ error: 'UID e dados da conta são obrigatórios.' });
+    let comprovanteUrl = conta.comprovanteUrl || null;
+
+    try {
+        if (req.file) {
+            comprovanteUrl = await uploadFileToStorage(req.file, uid);
+        }
+        const dadosParaSalvar = { ...conta, valor: parseFloat(conta.valor) || 0, comprovanteUrl };
+
+        if (req.method === 'POST') {
+            const newId = 'manual_' + Date.now();
+            dadosParaSalvar.id = newId;
+            dadosParaSalvar.origem = 'manual';
+            dadosParaSalvar.situacao = 2;
+            await db.collection('users').doc(uid).collection(collectionName).doc(newId).set(dadosParaSalvar);
+            res.json({ success: true, data: dadosParaSalvar });
+        } else if (req.method === 'PUT') {
+            if (!id) return res.status(400).json({ error: 'ID do lançamento é obrigatório.' });
+            await db.collection('users').doc(uid).collection(collectionName).doc(id).update(dadosParaSalvar);
+            res.json({ success: true, data: dadosParaSalvar });
+        }
+    } catch (e) {
+        res.status(500).json({ error: 'Erro ao salvar lançamento.', details: e.message });
+    }
+};
+
+const handleExcluirLancamento = (collectionName) => async (req, res) => {
+    const { uid } = req.body;
+    const { id } = req.params;
+    if (!uid || !id) return res.status(400).json({ error: 'Dados incompletos.' });
+    try {
+        await db.collection('users').doc(uid).collection(collectionName).doc(id).delete();
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: 'Erro ao excluir lançamento', details: e.message });
+    }
+};
+
+router.post('/firestore/contas-pagar', upload.single('comprovante'), handleLancamento('blingContasPagar'));
+router.put('/firestore/contas-pagar/:id', upload.single('comprovante'), handleLancamento('blingContasPagar'));
+router.delete('/firestore/contas-pagar/:id', handleExcluirLancamento('blingContasPagar'));
+
+router.post('/firestore/contas-receber', upload.single('comprovante'), handleLancamento('blingContasReceber'));
+router.put('/firestore/contas-receber/:id', upload.single('comprovante'), handleLancamento('blingContasReceber'));
+router.delete('/firestore/contas-receber/:id', handleExcluirLancamento('blingContasReceber'));
+
 router.post('/firestore/contas-pagar/import-lote', async (req, res) => {
     const { uid, contas } = req.body;
     if (!uid || !Array.isArray(contas) || contas.length === 0) {
-        return res.status(400).json({ error: 'UID e contas obrigatórios' });
+        return res.status(400).json({ error: 'UID e um array de contas são obrigatórios.' });
     }
 
     const batch = db.batch();
-    const categoriasSet = new Set();
+    const categoriasParaCriar = new Map();
 
-    contas.forEach((conta, idx) => {
-        let id = conta.id;
-        if (!id) {
-            id = 'excel_' + Date.now() + '_' + Math.floor(Math.random() * 1000000) + '_' + idx;
-            conta.id = id;
+    contas.forEach(conta => {
+        // Assegura que cada conta tenha um ID único
+        const docRef = db.collection('users').doc(uid).collection('blingContasPagar').doc(conta.id);
+
+        // Se a categoria for uma string, prepara para criação
+        if (conta.categoria && typeof conta.categoria.descricao === 'string' && conta.categoria.descricao.trim() !== '') {
+            const catDesc = conta.categoria.descricao.trim();
+            if (!categoriasParaCriar.has(catDesc.toLowerCase())) {
+                 categoriasParaCriar.set(catDesc.toLowerCase(), {
+                    id: `manual_${catDesc.toLowerCase().replace(/\s+/g, '_')}`,
+                    descricao: catDesc,
+                    tipo: 1, // Despesa por padrão
+                    origem: 'manual'
+                 });
+            }
+            // Atualiza o objeto da conta com a referência de ID correta
+            conta.categoria.id = categoriasParaCriar.get(catDesc.toLowerCase()).id;
         }
 
-        // Categoria: salva para criar depois
-        if (conta.categoria && typeof conta.categoria === 'string') {
-            categoriasSet.add(conta.categoria.trim());
-            conta.categoria = { id: conta.categoria.trim(), descricao: conta.categoria.trim(), tipo: 1 };
-        }
-
-        const ref = db.collection('users').doc(uid).collection('blingContasPagar').doc(String(id));
-        batch.set(ref, conta, { merge: true });
+        batch.set(docRef, conta);
     });
 
-    // Salva categorias básicas em lote
-    const categoriasPromises = Array.from(categoriasSet).map(async (catId) => {
-        if (!catId) return;
-        const categoriaRef = db.collection('users').doc(uid).collection('blingCategorias').doc(catId);
-        const catSnap = await categoriaRef.get();
-        if (!catSnap.exists) {
-            await categoriaRef.set({
-                id: catId,
-                descricao: catId,
-                tipo: 1
-            }, { merge: true });
-        }
-    });
+    // Cria as novas categorias que não existem
+    for (const cat of categoriasParaCriar.values()) {
+        const catRef = db.collection('users').doc(uid).collection('blingCategorias').doc(cat.id);
+        batch.set(catRef, cat, { merge: true }); // Usa merge para não sobrescrever se já existir
+    }
 
     try {
-        await Promise.all(categoriasPromises);
         await batch.commit();
         res.json({ success: true, count: contas.length });
     } catch (e) {
-        res.status(500).json({ error: 'Erro ao importar contas a pagar em lote', details: e.message });
+        console.error('Erro ao importar contas em lote:', e);
+        res.status(500).json({ error: 'Erro ao importar contas em lote', details: e.message });
     }
 });
-
 
 module.exports = router;
