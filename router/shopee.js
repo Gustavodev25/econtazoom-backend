@@ -116,17 +116,22 @@ function getRedirectUri() {
 router.get('/auth', (req, res) => {
     const { uid } = req.query;
     if (!uid) return res.status(400).send('UID do usuário é obrigatório.');
+
     const redirectUri = getRedirectUri();
     if (!redirectUri) return res.status(500).send('Erro no servidor: URL de redirecionamento não criada.');
+
     const finalRedirectUri = `${redirectUri}?uid=${uid}`;
     const timestamp = Math.floor(Date.now() / 1000);
     const path = '/api/v2/shop/auth_partner';
     const sign = generateSign(path, CLIENT_ID, timestamp);
+
     const authUrl = new URL(`${SHOPEE_BASE_URL}${path}`);
     authUrl.searchParams.append('partner_id', CLIENT_ID);
     authUrl.searchParams.append('timestamp', timestamp);
     authUrl.searchParams.append('sign', sign);
     authUrl.searchParams.append('redirect', finalRedirectUri);
+
+    console.log(`[Shopee Auth] Redirecionando para URL de autenticação: ${authUrl.toString()}`);
     res.redirect(authUrl.toString());
 });
 
