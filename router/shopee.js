@@ -4,8 +4,8 @@ const crypto = require('crypto');
 const axios = require('axios');
 const { db } = require('../firebase');
 
-const CLIENT_ID = process.env.SHOPEE_CLIENT_ID || '2011938';
-const CLIENT_SECRET = process.env.SHOPEE_CLIENT_SECRET || 'shpk527477684f57526b554d567743746d766e51795778465974447565734c52';
+const CLIENT_ID = process.env.SHOPEE_CLIENT_ID || '2011925';
+const CLIENT_SECRET = process.env.SHOPEE_CLIENT_SECRET || 'shpk6b594c726471596464645a4a436b437867576462567a5758687647617448';
 const SHOPEE_BASE_URL = 'https://openplatform.shopee.com.br';
 
 function generateSign(path, partner_id, timestamp, access_token = '', shop_id = '') {
