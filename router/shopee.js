@@ -8,15 +8,6 @@ const CLIENT_ID = process.env.SHOPEE_CLIENT_ID || '2011938';
 const CLIENT_SECRET = process.env.SHOPEE_CLIENT_SECRET || 'shpk527477684f57526b554d567743746d766e51795778465974447565734c52';
 const SHOPEE_BASE_URL = 'https://openplatform.shopee.com.br';
 
-const NGROK = { url: null }; // Para armazenar a URL do ngrok dinamicamente
-
-function getBaseDomain(req) {
-    if (process.env.NODE_ENV === 'production' || !NGROK.url) {
-        return 'https://econtazoom-backend.onrender.com';
-    }
-    return NGROK.url || req.app.locals.ngrokUrl;
-}
-
 function generateSign(path, partner_id, timestamp, access_token = '', shop_id = '') {
     const baseString = `${partner_id}${path}${timestamp}${access_token}${shop_id}`;
     return crypto.createHmac('sha256', CLIENT_SECRET).update(baseString).digest('hex');
@@ -116,9 +107,9 @@ async function getValidTokenShopee(uid, shopId, retryCount = 0) {
 router.get('/auth', (req, res) => {
     const { uid } = req.query;
     if (!uid) return res.status(400).send('UID do usuário é obrigatório.');
-    const baseDomain = getBaseDomain(req);
-    if (!baseDomain) return res.status(500).send('Erro no servidor: URL de redirecionamento não criada.');
-    const redirectUri = `${baseDomain}/shopee/callback`;
+    const backendUrl = 'https://econtazoom-backend.onrender.com'; // URL fixa
+    const redirectUri = `${backendUrl}/shopee/callback`;
+    const finalRedirectUri = `${redirectUri}?uid=${uid}`;
     const timestamp = Math.floor(Date.now() / 1000);
     const path = '/api/v2/shop/auth_partner';
     const sign = generateSign(path, CLIENT_ID, timestamp);
@@ -126,7 +117,7 @@ router.get('/auth', (req, res) => {
     authUrl.searchParams.append('partner_id', CLIENT_ID);
     authUrl.searchParams.append('timestamp', timestamp);
     authUrl.searchParams.append('sign', sign);
-    authUrl.searchParams.append('redirect', baseDomain); // Apenas o domínio base
+    authUrl.searchParams.append('redirect', finalRedirectUri);
     res.redirect(authUrl.toString());
 });
 
@@ -464,13 +455,4 @@ async function validarECorrigirVenda(uid, venda) {
     return camposCorrigidos;
 }
 
-router.post('/ngrok-url', (req, res) => {
-    const { url } = req.body;
-    if (!url) return res.status(400).json({ error: 'URL do ngrok é obrigatória.' });
-    NGROK.url = url;
-    console.log(`[Shopee] URL do ngrok atualizada para: ${url}`);
-    res.json({ success: true, url });
-});
-
 module.exports = router;
-module.exports.NGROK = NGROK;

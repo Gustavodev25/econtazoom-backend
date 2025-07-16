@@ -556,13 +556,5 @@ router.post('/vendas/fake', async (req, res) => {
     }
 });
 
-router.post('/ngrok-url', (req, res) => {
-    const { url } = req.body;
-    if (!url) return res.status(400).json({ error: 'URL do ngrok é obrigatória.' });
-    NGROK.url = url;
-    console.log(`[Mercado Livre] URL do ngrok atualizada para: ${url}`);
-    res.json({ success: true, url });
-});
-
 module.exports = router;
 module.exports.NGROK = NGROK;
