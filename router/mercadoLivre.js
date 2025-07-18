@@ -71,7 +71,7 @@ async function getValidTokenML(uid, contaId) {
     }
 
     const tokenCreationTime = new Date(contaData.updatedAt || contaData.createdAt).getTime();
-    const expiresInMilliseconds = (contaData.expires_in - 300) * 1000;
+    const expiresInMilliseconds = (contaData.expires_in - 300) * 1000; // 5 minutos de margem
 
     if (Date.now() - tokenCreationTime > expiresInMilliseconds) {
         console.log(`[ML Token Check] Token para conta ${contaId} expirado. Renovando...`);
@@ -312,28 +312,44 @@ router.get('/vendas/list_for_account', async (req, res) => {
     }
 });
 
+/**
+ * FUNÇÃO DE CÁLCULO DO FRETE AJUSTADO - LÓGICA FINAL
+ * Calcula o valor do frete, diferenciando CUSTO de RECEITA.
+ * @param {object} orderDetails - Detalhes do pedido da API (/orders/{id}).
+ * @param {object} shippingDetails - Detalhes do envio da API (/shipments/{id}).
+ * @returns {number} Valor do frete. Positivo para CUSTO, Negativo para RECEITA.
+ */
 function calcularFreteAdjust(orderDetails, shippingDetails) {
     const logisticType = shippingDetails?.logistic_type;
     const shippingOption = shippingDetails?.shipping_option;
     const totalAmount = Number(orderDetails?.total_amount) || 0;
 
+    // Lógica para ME FLEX (self_service)
     if (logisticType === 'self_service') {
         if (totalAmount > 79) {
-            return 1.59;
+            const flexRevenue = 1.59; // Valor fixo mencionado pelo usuário.
+            console.log(`[Frete ML] Envio FLEX > R$79 detectado. Receita: ${flexRevenue}`);
+            return flexRevenue; // Valor positivo para modalidade FLEX
         }
-        return Number(shippingOption?.cost) || 0;
+        const flexRevenueUnder79 = Number(shippingOption?.cost) || 0;
+        console.log(`[Frete ML] Envio FLEX <= R$79 detectado. Receita: ${flexRevenueUnder79}`);
+        return flexRevenueUnder79; // Valor positivo para modalidade FLEX
     }
 
+    // Lógica para ME2 (drop_off, cross_docking, etc)
     const listCost = Number(shippingOption?.list_cost) || 0;
     const buyerCost = Number(shippingOption?.cost) || 0;
 
     if (listCost === 0) {
+        console.log(`[Frete ML] Custo de tabela (list_cost) é 0. Custo do frete para o vendedor é 0.`);
         return 0;
     }
 
     const sellerCost = listCost - buyerCost;
-    return parseFloat(Math.max(0, sellerCost).toFixed(2));
+    console.log(`[Frete ML - Custo] Custo Tabela (${listCost}) - Custo Comprador (${buyerCost}) = ${sellerCost}`);
+    return parseFloat(Math.max(0, sellerCost).toFixed(2)); // Garante que o custo não seja negativo
 }
+
 
 router.get('/vendas/detail/:orderId', async (req, res) => {
     const { uid, sellerId } = req.query;
@@ -357,26 +373,54 @@ router.get('/vendas/detail/:orderId', async (req, res) => {
         const orderDetails = await detailsRes.json();
         
         let shipmentDetails = {};
+        let shippingCost = 0;
         if (orderDetails.shipping?.id) {
-            const shipmentRes = await fetch(`https://api.mercadolibre.com/shipments/${orderDetails.shipping.id}`, { headers: { Authorization: `Bearer ${access_token}` } });
-            if (shipmentRes.ok) {
-                shipmentDetails = await shipmentRes.json();
+            try {
+                const shipmentRes = await fetch(`https://api.mercadolibre.com/shipments/${orderDetails.shipping.id}`, { headers: { Authorization: `Bearer ${access_token}` } });
+                if (shipmentRes.ok) {
+                    shipmentDetails = await shipmentRes.json();
+                    // A chamada para a função de cálculo agora usa a nova lógica com logs
+                    shippingCost = typeof calcularFreteAdjust(orderDetails, shipmentDetails) === 'number' ? calcularFreteAdjust(orderDetails, shipmentDetails) : 0;
+                } else {
+                    console.warn(`[ML Detail] Não foi possível buscar shipment para venda ${orderId}. Salvando sem frete.`);
+                }
+            } catch (err) {
+                console.warn(`[ML Detail] Erro de rede ao buscar shipment para venda ${orderId}: ${err.message}`);
             }
         }
-        
-        const finalData = { 
-            ...orderDetails, 
-            shipping_details: shipmentDetails, 
+
+        // --- PROCESSAMENTO DOS DADOS PARA SALVAR NO FIRESTORE ---
+        const orderItems = Array.isArray(orderDetails.order_items) ? orderDetails.order_items : [];
+        let custoTotalML = 0;
+        orderItems.forEach(item => {
+            const sku = item.item?.seller_sku;
+            if (sku) custoTotalML += 0; // Pode ser ajustado se houver custo unitário
+        });
+        const saleFee = orderItems.reduce((acc, item) => acc + (item.sale_fee || 0), 0);
+        const cliente = orderDetails.buyer?.nickname || orderDetails.buyer?.first_name || 'Desconhecido';
+
+        const vendaFinal = {
+            ...orderDetails,
+            shipping_details: shipmentDetails,
             updatedAt: new Date().toISOString(),
             nomeConta: nomeConta,
-            frete_adjust: calcularFreteAdjust(orderDetails, shipmentDetails)
+            frete_adjust: shippingCost,
+            canalVenda: 'Mercado Livre',
+            idVendaMarketplace: orderDetails.id?.toString() || orderId,
+            cliente,
+            nomeProdutoVendido: orderItems[0]?.item?.title || '-',
+            dataHora: orderDetails.date_created || '-',
+            valorTotalVenda: Number(orderDetails.total_amount || 0),
+            txPlataforma: saleFee,
+            custoFrete: shippingCost,
+            custo: custoTotalML
         };
 
         const vendaDocRef = db.collection('users').doc(uid).collection('mlVendas').doc(orderId);
-        await vendaDocRef.set(finalData, { merge: true });
+        await vendaDocRef.set(vendaFinal, { merge: true });
         
-        console.log(`[ML Detail] Detalhes da venda ${orderId} (Vendedor: ${sellerId}) salvos com frete_adjust: ${finalData.frete_adjust}.`);
-        res.json(finalData);
+        console.log(`[ML Detail] Detalhes da venda ${orderId} (Vendedor: ${sellerId}) salvos com frete_adjust: ${vendaFinal.frete_adjust}.`);
+        res.json(vendaFinal);
 
     } catch (error) {
         console.error(`[ML Detail] Erro ao processar venda ${orderId}:`, error);
@@ -384,5 +428,109 @@ router.get('/vendas/detail/:orderId', async (req, res) => {
     }
 });
   
+router.get('/vendas/sync_for_account', async (req, res) => {
+    const { uid, accountId } = req.query;
+    if (!uid || !accountId) {
+        return res.status(400).json({ error: 'UID e accountId são obrigatórios' });
+    }
+
+    try {
+        const access_token = await getValidTokenML(uid, accountId);
+        let allResults = [];
+        let offset = 0;
+        const limit = 50;
+
+        // Busca todas as vendas pagas
+        while (true) {
+            const url = `https://api.mercadolibre.com/orders/search?seller=${accountId}&order.status=paid&sort=date_desc&offset=${offset}&limit=${limit}`;
+            const vendasRes = await fetch(url, { headers: { Authorization: `Bearer ${access_token}` } });
+
+            if (!vendasRes.ok) {
+                const errorData = await vendasRes.json();
+                console.error(`[ML Sync For Account] Erro na API do ML para a conta ${accountId}:`, errorData.message);
+                break;
+            }
+
+            const vendasData = await vendasRes.json();
+            if (vendasData.results && vendasData.results.length > 0) {
+                allResults.push(...vendasData.results);
+                offset += limit;
+            } else {
+                break;
+            }
+        }
+
+        // Busca nickname da conta
+        const contaSnap = await db.collection('users').doc(uid).collection('mercadoLivre').doc(accountId).get();
+        const nomeConta = contaSnap.exists ? contaSnap.data().nickname : `Conta ${accountId}`;
+
+        // Para cada venda, busca detalhes e salva no Firestore
+        let salvos = 0;
+        for (const venda of allResults) {
+            try {
+                const detailsRes = await fetch(`https://api.mercadolibre.com/orders/${venda.id}`, { headers: { Authorization: `Bearer ${access_token}` } });
+                if (!detailsRes.ok) continue;
+                const orderDetails = await detailsRes.json();
+
+                let shipmentDetails = {};
+                let shippingCost = 0;
+                if (orderDetails.shipping?.id) {
+                    try {
+                        const shipmentRes = await fetch(`https://api.mercadolibre.com/shipments/${orderDetails.shipping.id}`, { headers: { Authorization: `Bearer ${access_token}` } });
+                        if (shipmentRes.ok) {
+                            shipmentDetails = await shipmentRes.json();
+                            // A chamada para a função de cálculo agora usa a nova lógica com logs
+                            shippingCost = typeof calcularFreteAdjust(orderDetails, shipmentDetails) === 'number' ? calcularFreteAdjust(orderDetails, shipmentDetails) : 0;
+                        } else {
+                            console.warn(`[ML Sync] Não foi possível buscar shipment para venda ${venda.id}. Salvando sem frete.`);
+                        }
+                    } catch (err) {
+                        console.warn(`[ML Sync] Erro de rede ao buscar shipment para venda ${venda.id}: ${err.message}`);
+                    }
+                }
+
+                // Processa os dados igual ao /vendas/detail/:orderId
+                const orderItems = Array.isArray(orderDetails.order_items) ? orderDetails.order_items : [];
+                let custoTotalML = 0;
+                orderItems.forEach(item => {
+                    const sku = item.item?.seller_sku;
+                    if (sku) custoTotalML += 0;
+                });
+                const saleFee = orderItems.reduce((acc, item) => acc + (item.sale_fee || 0), 0);
+                const cliente = orderDetails.buyer?.nickname || orderDetails.buyer?.first_name || 'Desconhecido';
+
+                const vendaFinal = {
+                    ...orderDetails,
+                    shipping_details: shipmentDetails,
+                    updatedAt: new Date().toISOString(),
+                    nomeConta: nomeConta,
+                    frete_adjust: shippingCost,
+                    canalVenda: 'Mercado Livre',
+                    idVendaMarketplace: orderDetails.id?.toString() || venda.id?.toString(),
+                    cliente,
+                    nomeProdutoVendido: orderItems[0]?.item?.title || '-',
+                    dataHora: orderDetails.date_created || '-',
+                    valorTotalVenda: Number(orderDetails.total_amount || 0),
+                    txPlataforma: saleFee,
+                    custoFrete: shippingCost,
+                    custo: custoTotalML,
+                    seller_account_id: accountId // <-- identifica a conta da venda
+                };
+
+                // Salva SEMPRE em mlVendas, usando o id do pedido como ID do documento
+                await db.collection('users').doc(uid).collection('mlVendas').doc(orderDetails.id.toString()).set(vendaFinal, { merge: true });
+                salvos++;
+            } catch (err) {
+                console.error(`[ML Sync For Account] Erro ao salvar venda ${venda.id}:`, err.message);
+            }
+        }
+
+        res.json({ total: allResults.length, salvos });
+    } catch (error) {
+        console.error(`[ML Sync For Account] Erro geral ao sincronizar vendas da conta ${accountId}:`, error);
+        res.status(500).json({ error: `Erro ao sincronizar vendas da conta ${accountId}`, detalhe: error.message });
+    }
+});
+
 module.exports = router;
 module.exports.NGROK = NGROK;
