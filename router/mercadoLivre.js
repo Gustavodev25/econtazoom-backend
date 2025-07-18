@@ -2,7 +2,7 @@ const express = require('express');
 const fetch = (...args) => import('node-fetch').then(m => m.default(...args));
 const crypto = require('crypto');
 const router = express.Router();
-const { db } = require('../firebase'); // Importar o db corretamente
+const { db } = require('../firebase'); 
 
 const CLIENT_ID = '4762241412857004';
 const CLIENT_SECRET = 'yBJNREOR3izbhIGRJtUP8P4FsGNXLIvB';
@@ -10,15 +10,8 @@ const NGROK = { url: null };
 
 const codeVerifiers = new Map();
 
-// --- FUNÇÕES DE AUTENTICAÇÃO E TOKEN (COM ADIÇÃO DE REFRESH TOKEN) ---
+// --- FUNÇÕES DE AUTENTICAÇÃO E TOKEN ---
 
-/**
- * Renova o access_token do Mercado Livre usando o refresh_token.
- * @param {string} uid - O UID do usuário no Firebase.
- * @param {string} contaId - O ID da conta do Mercado Livre (user_id).
- * @param {object} contaData - Os dados atuais da conta contendo o refresh_token.
- * @returns {Promise<string>} O novo access_token.
- */
 async function refreshTokenML(uid, contaId, contaData) {
   console.log(`[ML Token Refresh] Solicitando novo token para conta: ${contaId}`);
   try {
@@ -45,7 +38,7 @@ async function refreshTokenML(uid, contaId, contaData) {
     const novaContaData = {
       ...contaData,
       access_token,
-      refresh_token, // O ML pode retornar um novo refresh_token
+      refresh_token,
       expires_in,
       updatedAt: new Date().toISOString(),
       lastTokenRefresh: new Date().toISOString()
@@ -63,12 +56,6 @@ async function refreshTokenML(uid, contaId, contaData) {
   }
 }
 
-/**
- * Obtém um token de acesso válido, verificando a expiração e renovando se necessário.
- * @param {string} uid - O UID do usuário no Firebase.
- * @param {string} contaId - O ID da conta do Mercado Livre (user_id).
- * @returns {Promise<string>} Um access_token válido.
- */
 async function getValidTokenML(uid, contaId) {
     const contaRef = db.collection('users').doc(uid).collection('mercadoLivre').doc(contaId);
     const contaSnap = await contaRef.get();
@@ -84,7 +71,7 @@ async function getValidTokenML(uid, contaId) {
     }
 
     const tokenCreationTime = new Date(contaData.updatedAt || contaData.createdAt).getTime();
-    const expiresInMilliseconds = (contaData.expires_in - 300) * 1000; // 5 minutos de margem de segurança
+    const expiresInMilliseconds = (contaData.expires_in - 300) * 1000;
 
     if (Date.now() - tokenCreationTime > expiresInMilliseconds) {
         console.log(`[ML Token Check] Token para conta ${contaId} expirado. Renovando...`);
@@ -177,7 +164,7 @@ router.get('/callback', async (req, res) => {
       throw new Error('code_verifier não encontrado');
     }
 
-    const tokenResponse = await fetch('https://api.mercadolivre.com/oauth/token', {
+    const tokenResponse = await fetch('https://api.mercadolibre.com/oauth/token', {
       method: 'POST',
       headers: {
         'Accept': 'application/json',
@@ -227,7 +214,7 @@ router.get('/callback', async (req, res) => {
       refresh_token: refresh_token || null,
       status: 'ativo',
       createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(), // Usado para controle de expiração do token
+      updatedAt: new Date().toISOString(),
       expires_in,
     }, { merge: true });
 
@@ -263,10 +250,6 @@ router.get('/contas', async (req, res) => {
     }
 });
 
-/**
- * ROTA DE CACHE: Lê as vendas JÁ SALVAS no Firestore.
- * Usada para popular a tabela instantaneamente com dados antigos.
- */
 router.get('/vendas', async (req, res) => {
     const { uid } = req.query;
     if (!uid) {
@@ -283,86 +266,52 @@ router.get('/vendas', async (req, res) => {
     }
 });
 
-/**
- * NOVA ROTA DE LISTA: Busca TODAS as vendas da API do ML com paginação PARA TODAS AS CONTAS.
- * Não salva nada, apenas retorna a lista completa para o frontend orquestrar.
- */
-router.get('/vendas/list', async (req, res) => {
-    const { uid } = req.query;
-    if (!uid) {
-        return res.status(400).json({ error: 'UID obrigatório' });
+router.get('/vendas/list_for_account', async (req, res) => {
+    const { uid, accountId } = req.query;
+    if (!uid || !accountId) {
+        return res.status(400).json({ error: 'UID e accountId são obrigatórios' });
     }
 
     try {
-        const contasSnap = await db.collection('users').doc(uid).collection('mercadoLivre').get();
-        if (contasSnap.empty) {
-            return res.json({ results: [] });
-        }
-
+        console.log(`[ML List For Account] Iniciando busca de vendas para a conta: ${accountId}`);
+        const access_token = await getValidTokenML(uid, accountId);
         let allResults = [];
-        // Removido o limitador de vendas
-        let totalFetched = 0;
+        let offset = 0;
+        const limit = 50;
 
-        for (const contaDoc of contasSnap.docs) {
-            const contaData = contaDoc.data();
-            const contaId = contaDoc.id;
-            const user_id = contaData.user_id;
+        while (true) {
+            const url = `https://api.mercadolibre.com/orders/search?seller=${accountId}&order.status=paid&sort=date_desc&offset=${offset}&limit=${limit}`;
+            const vendasRes = await fetch(url, { headers: { Authorization: `Bearer ${access_token}` } });
 
-            console.log(`[ML List] Iniciando busca de vendas para a conta: ${contaData.nickname} (${user_id})`);
+            if (!vendasRes.ok) {
+                const errorData = await vendasRes.json();
+                console.error(`[ML List For Account] Erro na API do ML para a conta ${accountId}:`, errorData.message);
+                break;
+            }
+
+            const vendasData = await vendasRes.json();
             
-            try {
-                const access_token = await getValidTokenML(uid, contaId);
-                let offset = 0;
-                const limit = 50;
-
-                while (true) {
-                    const url = `https://api.mercadolibre.com/orders/search?seller=${user_id}&order.status=paid&sort=date_desc&offset=${offset}&limit=${limit}`;
-                    const vendasRes = await fetch(url, { headers: { Authorization: `Bearer ${access_token}` } });
-
-                    if (!vendasRes.ok) {
-                        const errorData = await vendasRes.json();
-                        console.error(`[ML List] Erro na API do ML para a conta ${user_id}:`, errorData.message);
-                        break;
-                    }
-
-                    const vendasData = await vendasRes.json();
-                    
-                    if (vendasData.results && vendasData.results.length > 0) {
-                        const vendasComSeller = vendasData.results.map(v => ({
-                            ...v,
-                            seller_account_id: user_id 
-                        }));
-                        allResults.push(...vendasComSeller);
-                        totalFetched += vendasComSeller.length;
-
-                        offset += limit;
-                        console.log(`[ML List] Conta ${user_id}: Página ${offset / limit} buscada. Total de vendas até agora: ${allResults.length}`);
-                    } else {
-                        break;
-                    }
-                }
-            } catch (contaError) {
-                console.error(`[ML List] Erro ao processar a conta ${contaData.nickname}:`, contaError.message);
-                continue;
+            if (vendasData.results && vendasData.results.length > 0) {
+                const vendasComSeller = vendasData.results.map(v => ({
+                    ...v,
+                    seller_account_id: accountId 
+                }));
+                allResults.push(...vendasComSeller);
+                offset += limit;
+            } else {
+                break;
             }
         }
         
-        console.log(`[ML List] Busca finalizada. Retornando lista de ${allResults.length} vendas de todas as contas para o frontend.`);
+        console.log(`[ML List For Account] Busca finalizada. Retornando lista de ${allResults.length} vendas para a conta ${accountId}.`);
         res.json({ results: allResults });
 
     } catch (error) {
-        console.error('[ML List] Erro geral ao buscar lista de vendas:', error);
-        res.status(500).json({ error: 'Erro ao buscar lista de vendas', detalhe: error.message });
+        console.error(`[ML List For Account] Erro geral ao buscar lista de vendas para a conta ${accountId}:`, error);
+        res.status(500).json({ error: `Erro ao buscar lista de vendas para a conta ${accountId}`, detalhe: error.message });
     }
 });
 
-/**
- * FUNÇÃO DE CÁLCULO DO FRETE AJUSTADO - LÓGICA FINAL
- * Calcula o valor do frete, diferenciando CUSTO de RECEITA.
- * @param {object} orderDetails - Detalhes do pedido da API (/orders/{id}).
- * @param {object} shippingDetails - Detalhes do envio da API (/shipments/{id}).
- * @returns {number} Valor do frete. Positivo para CUSTO, Negativo para RECEITA.
- */
 function calcularFreteAdjust(orderDetails, shippingDetails) {
     const logisticType = shippingDetails?.logistic_type;
     const shippingOption = shippingDetails?.shipping_option;
@@ -370,33 +319,22 @@ function calcularFreteAdjust(orderDetails, shippingDetails) {
 
     if (logisticType === 'self_service') {
         if (totalAmount > 79) {
-            const flexRevenue = 1.59; // Valor fixo mencionado pelo usuário.
-            console.log(`[Frete ML] Envio FLEX > R$79 detectado. Receita: ${flexRevenue}`);
-            return flexRevenue; // Valor positivo para modalidade FLEX
+            return 1.59;
         }
-        const flexRevenueUnder79 = Number(shippingOption?.cost) || 0;
-        console.log(`[Frete ML] Envio FLEX <= R$79 detectado. Receita: ${flexRevenueUnder79}`);
-        return flexRevenueUnder79; // Valor positivo para modalidade FLEX
+        return Number(shippingOption?.cost) || 0;
     }
 
     const listCost = Number(shippingOption?.list_cost) || 0;
     const buyerCost = Number(shippingOption?.cost) || 0;
 
     if (listCost === 0) {
-        console.log(`[Frete ML] Custo de tabela (list_cost) é 0. Custo do frete para o vendedor é 0.`);
         return 0;
     }
 
     const sellerCost = listCost - buyerCost;
-    console.log(`[Frete ML - Custo] Custo Tabela (${listCost}) - Custo Comprador (${buyerCost}) = ${sellerCost}`);
-    return parseFloat(Math.max(0, sellerCost).toFixed(2)); // Valor positivo para custos
+    return parseFloat(Math.max(0, sellerCost).toFixed(2));
 }
 
-
-/**
- * ROTA DE DETALHE: Busca detalhes de UMA venda, salva no Firestore e retorna.
- * Adiciona o campo `frete_adjust` antes de salvar com a nova lógica de cálculo.
- */
 router.get('/vendas/detail/:orderId', async (req, res) => {
     const { uid, sellerId } = req.query;
     const { orderId } = req.params;
@@ -407,10 +345,12 @@ router.get('/vendas/detail/:orderId', async (req, res) => {
     try {
         const access_token = await getValidTokenML(uid, sellerId.toString());
 
+        const contaSnap = await db.collection('users').doc(uid).collection('mercadoLivre').doc(sellerId).get();
+        const nomeConta = contaSnap.exists ? contaSnap.data().nickname : `Conta ${sellerId}`;
+
         const detailsRes = await fetch(`https://api.mercadolibre.com/orders/${orderId}`, { headers: { Authorization: `Bearer ${access_token}` } });
         if (!detailsRes.ok) {
             const errorData = await detailsRes.json();
-            console.error(`Erro ao buscar detalhes do pedido ${orderId}:`, errorData);
             throw new Error(`Falha ao buscar detalhes do pedido ${orderId}: ${errorData.message}`);
         }
         
@@ -421,19 +361,16 @@ router.get('/vendas/detail/:orderId', async (req, res) => {
             const shipmentRes = await fetch(`https://api.mercadolibre.com/shipments/${orderDetails.shipping.id}`, { headers: { Authorization: `Bearer ${access_token}` } });
             if (shipmentRes.ok) {
                 shipmentDetails = await shipmentRes.json();
-            } else {
-                console.warn(`Não foi possível buscar detalhes do envio para o pedido ${orderId}. O envio pode não existir ou a API retornou um erro.`);
             }
         }
         
         const finalData = { 
             ...orderDetails, 
             shipping_details: shipmentDetails, 
-            updatedAt: new Date().toISOString() 
+            updatedAt: new Date().toISOString(),
+            nomeConta: nomeConta,
+            frete_adjust: calcularFreteAdjust(orderDetails, shipmentDetails)
         };
-        
-        // Adiciona o campo calculado usando a função FINAL
-        finalData.frete_adjust = calcularFreteAdjust(orderDetails, shipmentDetails);
 
         const vendaDocRef = db.collection('users').doc(uid).collection('mlVendas').doc(orderId);
         await vendaDocRef.set(finalData, { merge: true });
@@ -447,114 +384,5 @@ router.get('/vendas/detail/:orderId', async (req, res) => {
     }
 });
   
-async function deleteCollectionBatch(db, collectionRef, batchSize) {
-    const query = collectionRef.limit(batchSize);
-    let deletedCount = 0;
-
-    while (true) {
-        const snapshot = await query.get();
-        if (snapshot.size === 0) {
-            break; 
-        }
-
-        const batch = db.batch();
-        snapshot.docs.forEach(doc => {
-            batch.delete(doc.ref);
-        });
-        await batch.commit();
-
-        deletedCount += snapshot.size;
-        console.log(`[ML Delete] Lote de ${snapshot.size} vendas excluído.`);
-    }
-    return deletedCount;
-}
-
-router.delete('/vendas', (req, res) => {
-    const uid = req.query.uid || req.body.uid;
-    if (!uid) {
-        return res.status(400).json({ error: 'UID obrigatório' });
-    }
-
-    res.json({ success: true, message: "A exclusão foi iniciada em segundo plano." });
-
-    console.log(`[ML Delete] Iniciando exclusão em segundo plano para UID: ${uid}`);
-    const vendasRef = db.collection('users').doc(uid).collection('mlVendas');
-    
-    deleteCollectionBatch(db, vendasRef, 200)
-        .then(deletedCount => {
-            console.log(`[ML Delete] Processo em segundo plano CONCLUÍDO. ${deletedCount} vendas excluídas para o UID ${uid}`);
-        })
-        .catch(err => {
-            console.error(`[ML Delete] Erro FATAL no processo de exclusão em segundo plano para UID ${uid}:`, err);
-        });
-});
-  
-router.post('/vendas/fake', async (req, res) => {
-    const { uid } = req.body;
-    if (!uid) {
-      return res.status(400).json({ error: 'UID obrigatório' });
-    }
-    try {
-      const fakeVenda = {
-        id: 'FAKE_ML_' + Date.now(),
-        order_id: 'FAKE_ML_' + Date.now(),
-        date_created: new Date().toISOString(),
-        date_closed: new Date().toISOString(),
-        status: 'paid',
-        status_detail: 'payment_received',
-        total_amount: 199.99,
-        paid_amount: 199.99,
-        currency_id: 'BRL',
-        buyer: {
-          id: '99999999',
-          nickname: 'comprador_teste',
-          first_name: 'João',
-          last_name: 'Silva'
-        },
-        seller: {
-          id: '88888888',
-          nickname: 'vendedor_teste'
-        },
-        order_items: [{
-          item: {
-            id: 'MLB123456789',
-            title: 'Produto Teste Mercado Livre',
-            seller_sku: 'SKU-FAKE-ML-01'
-          },
-          quantity: 2,
-          unit_price: 99.99,
-        }],
-        payments: [{
-          id: 'PAYMENT_FAKE_001',
-          status: 'approved',
-          transaction_amount: 199.99,
-          date_approved: new Date().toISOString(),
-          payment_method_id: 'credit_card',
-          installments: 1,
-          marketplace_fee: 22.00,
-        }],
-        shipping: {
-          id: 'SHIP_FAKE_001',
-          status: 'shipped',
-          delivery_type: 'me2',
-          tracking_number: 'TRK123456BR',
-          cost: 15.00 
-        },
-        updatedAt: new Date().toISOString()
-      };
-  
-      await db.collection('users')
-        .doc(uid)
-        .collection('mlVendas')
-        .doc(fakeVenda.id.toString())
-        .set(fakeVenda, { merge: true });
-  
-      res.json({ success: true, venda: fakeVenda });
-    } catch (err) {
-      console.error('[ML Fake] Erro ao criar venda fake:', err);
-      res.status(500).json({ error: 'Erro ao criar venda fake', detalhe: err.message });
-    }
-});
-
 module.exports = router;
 module.exports.NGROK = NGROK;
