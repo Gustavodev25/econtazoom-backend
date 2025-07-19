@@ -108,7 +108,7 @@ router.get('/status', async (req, res) => {
         res.status(200).json({
             success: true,
             connected: !!(blingData && blingData.access_token),
-            connectedAt: blingData?.connectedAt || null,
+            bling: blingData || null  // Adicionando os dados completos do Bling
         });
     } catch (error) {
         res.status(500).json({ success: false, connected: false, error: 'Erro ao verificar status.' });
@@ -226,13 +226,19 @@ function mapBlingToFirestore(item, dataType, lookups = {}) {
     };
 }
 
-async function updateSyncStatus(uid, message) {
+// ATUALIZADO: Aceita um payload de objeto para mais detalhes de estado
+async function updateSyncStatus(uid, payload) {
     if (!uid) return;
     try {
-        await db.collection('users').doc(uid).collection('syncStatus').doc('bling').set({
-            message,
-            timestamp: new Date().toISOString(),
-        });
+        const statusRef = db.collection('users').doc(uid).collection('syncStatus').doc('bling');
+        if (payload === null) {
+            await statusRef.delete();
+        } else {
+            await statusRef.set({
+                ...payload,
+                timestamp: new Date().toISOString(),
+            });
+        }
     } catch (error) {
         console.error('[Sync Status] Erro ao atualizar status:', error);
     }
@@ -255,6 +261,7 @@ async function saveItemsInBatches(uid, items, collectionName, dataType, lookups)
     console.log(`[Sync Save] ${batches.length} lotes para ${collectionName} salvos (${items.length} itens).`);
 }
 
+// ATUALIZADO: Todas as chamadas para updateSyncStatus agora enviam um objeto
 async function syncDataType(uid, accessToken, dataType, apiPath, collectionName, lookups = {}) {
     const nomeAmigavel = dataType.replace('-', ' ');
     console.log(`[Sync] Iniciando sincronização de ${nomeAmigavel} para UID: ${uid}`);
@@ -265,7 +272,7 @@ async function syncDataType(uid, accessToken, dataType, apiPath, collectionName,
 
     while (hasMoreData) {
         try {
-            await updateSyncStatus(uid, `Sincronização: Buscando ${nomeAmigavel}, página ${pagina}...`);
+            await updateSyncStatus(uid, { syncing: true, message: `Sincronização: Buscando ${nomeAmigavel}, página ${pagina}...` });
             const listUrl = `https://www.bling.com.br/Api/v3${apiPath}?pagina=${pagina}&limite=${limitePorPagina}`;
             const listResponse = await requestWithRetry(listUrl, { 'Authorization': `Bearer ${accessToken}` });
             const items = listResponse.data?.data || [];
@@ -275,7 +282,7 @@ async function syncDataType(uid, accessToken, dataType, apiPath, collectionName,
             if (hasMoreData) await delay(200);
         } catch (error) {
             console.error(`[Sync Fetch] Erro ao buscar página ${pagina} de ${nomeAmigavel}:`, error.message);
-            await updateSyncStatus(uid, `Erro ao buscar ${nomeAmigavel} na página ${pagina}.`);
+            await updateSyncStatus(uid, { syncing: true, message: `Erro ao buscar ${nomeAmigavel} na página ${pagina}.` });
             throw error;
         }
     }
@@ -291,10 +298,9 @@ async function syncDataType(uid, accessToken, dataType, apiPath, collectionName,
         return;
     }
 
-    // Process details with controlled concurrency and incremental saves
     console.log(`[Sync Detail] Processando detalhes para ${allItems.length} itens de ${nomeAmigavel}...`);
     const CONCURRENCY_LIMIT = 15;
-    const BATCH_SAVE_SIZE = 100; // Save after every 100 items
+    const BATCH_SAVE_SIZE = 100;
     const queue = [...allItems];
     let itemsProcessed = 0;
     const totalItems = allItems.length;
@@ -315,14 +321,14 @@ async function syncDataType(uid, accessToken, dataType, apiPath, collectionName,
             itemsProcessed++;
             if (batchItems.length >= BATCH_SAVE_SIZE || itemsProcessed === totalItems) {
                 if (batchItems.length > 0) {
-                    await updateSyncStatus(uid, `Sincronização: Salvando lote de ${batchItems.length} registros de ${nomeAmigavel} (${itemsProcessed}/${totalItems})...`);
+                    await updateSyncStatus(uid, { syncing: true, message: `Sincronização: Salvando lote de ${batchItems.length} registros de ${nomeAmigavel} (${itemsProcessed}/${totalItems})...` });
                     await saveItemsInBatches(uid, batchItems, collectionName, dataType, lookups);
                     console.log(`[Sync Detail] Lote de ${batchItems.length} itens salvo (${itemsProcessed}/${totalItems}).`);
-                    batchItems = []; // Clear batch after saving
+                    batchItems = [];
                 }
             }
             if (itemsProcessed % 100 === 0 || itemsProcessed === totalItems) {
-                await updateSyncStatus(uid, `Sincronização: Processando ${itemsProcessed}/${totalItems} de ${nomeAmigavel}...`);
+                await updateSyncStatus(uid, { syncing: true, message: `Sincronização: Processando ${itemsProcessed}/${totalItems} de ${nomeAmigavel}...` });
             }
         }
     }
@@ -330,9 +336,8 @@ async function syncDataType(uid, accessToken, dataType, apiPath, collectionName,
     const workers = Array.from({ length: CONCURRENCY_LIMIT }, () => worker());
     await Promise.all(workers);
 
-    // Save any remaining items
     if (batchItems.length > 0) {
-        await updateSyncStatus(uid, `Sincronização: Salvando lote final de ${batchItems.length} registros de ${nomeAmigavel}...`);
+        await updateSyncStatus(uid, { syncing: true, message: `Sincronização: Salvando lote final de ${batchItems.length} registros de ${nomeAmigavel}...` });
         await saveItemsInBatches(uid, batchItems, collectionName, dataType, lookups);
         console.log(`[Sync Detail] Lote final de ${batchItems.length} itens salvo.`);
     }
@@ -347,17 +352,18 @@ const syncConfig = {
     'formas-pagamentos': { path: '/formas-pagamentos', collection: 'blingFormasPagamentos' },
 };
 
+// ATUALIZADO: Orquestra todo o processo de sincronização com estados claros
 async function startSingleSync(uid, dataType) {
     const nomeAmigavel = dataType.replace('-', ' ');
     console.log(`[Sync] Requisição de sincronização para ${dataType} (UID: ${uid})`);
     try {
-        await updateSyncStatus(uid, `Iniciando sincronização de ${nomeAmigavel}...`);
+        await updateSyncStatus(uid, { syncing: true, message: `Iniciando sincronização de ${nomeAmigavel}...` });
         const accessToken = await getValidToken(uid);
         let lookups = {};
 
         const isFullSync = dataType === 'contas-pagar' || dataType === 'contas-receber';
         if (isFullSync) {
-            await updateSyncStatus(uid, 'Sincronização: Carregando categorias e formas de pagamento...');
+            await updateSyncStatus(uid, { syncing: true, message: 'Sincronização: Carregando categorias e formas de pagamento...' });
             lookups = await fetchAllLookups(accessToken);
             await Promise.all([
                 syncDataType(uid, accessToken, 'categorias', syncConfig['categorias'].path, syncConfig['categorias'].collection, {}),
@@ -371,17 +377,20 @@ async function startSingleSync(uid, dataType) {
         await syncDataType(uid, accessToken, dataType, config.path, config.collection, lookups);
 
         let finalMessage = `Sincronização de ${nomeAmigavel} concluída!`;
+
+        // Lógica de encadeamento para Contas a Pagar -> Contas a Receber
         if (dataType === 'contas-pagar') {
+            await updateSyncStatus(uid, { syncing: true, message: 'Contas a Pagar concluído. Iniciando Contas a Receber...' });
             const receberConfig = syncConfig['contas-receber'];
             await syncDataType(uid, accessToken, 'contas-receber', receberConfig.path, receberConfig.collection, lookups);
             finalMessage = 'Sincronização de Contas a Pagar e a Receber concluída!';
         }
 
-        await updateSyncStatus(uid, finalMessage);
+        await updateSyncStatus(uid, { syncing: false, message: finalMessage });
         setTimeout(() => updateSyncStatus(uid, null), 8000);
     } catch (error) {
         console.error(`[Sync] Erro na sincronização de ${dataType} para UID ${uid}:`, error.message);
-        await updateSyncStatus(uid, `Erro na sincronização de ${nomeAmigavel}.`);
+        await updateSyncStatus(uid, { syncing: false, message: `Erro na sincronização de ${nomeAmigavel}.` });
         setTimeout(() => updateSyncStatus(uid, null), 10000);
         throw error;
     }
@@ -393,13 +402,14 @@ router.post('/sync/single', async (req, res) => {
         return res.status(400).json({ error: 'UID e dataType são obrigatórios' });
     }
 
+    // Inicia o processo em segundo plano sem travar a resposta
     startSingleSync(uid, dataType).catch(err => {
         console.error(`[Sync Route] Erro na sincronização de ${dataType} (UID: ${uid}):`, err);
     });
 
     res.status(202).json({
         success: true,
-        message: `Sincronização de ${dataType} iniciada. Dados serão atualizados em breve.`,
+        message: `Sincronização de ${dataType} iniciada. O status será atualizado em tempo real.`,
     });
 });
 
