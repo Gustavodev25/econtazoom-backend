@@ -10,8 +10,6 @@ const NGROK = { url: null };
 
 const codeVerifiers = new Map();
 
-// --- FUNÇÕES DE AUTENTICAÇÃO E TOKEN ---
-
 async function refreshTokenML(uid, contaId, contaData) {
   console.log(`[ML Token Refresh] Solicitando novo token para conta: ${contaId}`);
   try {
@@ -312,31 +310,22 @@ router.get('/vendas/list_for_account', async (req, res) => {
     }
 });
 
-/**
- * FUNÇÃO DE CÁLCULO DO FRETE AJUSTADO - LÓGICA FINAL
- * Calcula o valor do frete, diferenciando CUSTO de RECEITA.
- * @param {object} orderDetails - Detalhes do pedido da API (/orders/{id}).
- * @param {object} shippingDetails - Detalhes do envio da API (/shipments/{id}).
- * @returns {number} Valor do frete. Positivo para CUSTO, Negativo para RECEITA.
- */
 function calcularFreteAdjust(orderDetails, shippingDetails) {
     const logisticType = shippingDetails?.logistic_type;
     const shippingOption = shippingDetails?.shipping_option;
     const totalAmount = Number(orderDetails?.total_amount) || 0;
 
-    // Lógica para ME FLEX (self_service)
     if (logisticType === 'self_service') {
         if (totalAmount > 79) {
-            const flexRevenue = 1.59; // Valor fixo mencionado pelo usuário.
+            const flexRevenue = 1.59; 
             console.log(`[Frete ML] Envio FLEX > R$79 detectado. Receita: ${flexRevenue}`);
-            return flexRevenue; // Valor positivo para modalidade FLEX
+            return flexRevenue; 
         }
         const flexRevenueUnder79 = Number(shippingOption?.cost) || 0;
         console.log(`[Frete ML] Envio FLEX <= R$79 detectado. Receita: ${flexRevenueUnder79}`);
-        return flexRevenueUnder79; // Valor positivo para modalidade FLEX
+        return flexRevenueUnder79; 
     }
 
-    // Lógica para ME2 (drop_off, cross_docking, etc)
     const listCost = Number(shippingOption?.list_cost) || 0;
     const buyerCost = Number(shippingOption?.cost) || 0;
 
@@ -347,7 +336,7 @@ function calcularFreteAdjust(orderDetails, shippingDetails) {
 
     const sellerCost = listCost - buyerCost;
     console.log(`[Frete ML - Custo] Custo Tabela (${listCost}) - Custo Comprador (${buyerCost}) = ${sellerCost}`);
-    return parseFloat(Math.max(0, sellerCost).toFixed(2)); // Garante que o custo não seja negativo
+    return parseFloat(Math.max(0, sellerCost).toFixed(2)); 
 }
 
 
@@ -379,7 +368,6 @@ router.get('/vendas/detail/:orderId', async (req, res) => {
                 const shipmentRes = await fetch(`https://api.mercadolibre.com/shipments/${orderDetails.shipping.id}`, { headers: { Authorization: `Bearer ${access_token}` } });
                 if (shipmentRes.ok) {
                     shipmentDetails = await shipmentRes.json();
-                    // A chamada para a função de cálculo agora usa a nova lógica com logs
                     shippingCost = typeof calcularFreteAdjust(orderDetails, shipmentDetails) === 'number' ? calcularFreteAdjust(orderDetails, shipmentDetails) : 0;
                 } else {
                     console.warn(`[ML Detail] Não foi possível buscar shipment para venda ${orderId}. Salvando sem frete.`);
@@ -389,12 +377,11 @@ router.get('/vendas/detail/:orderId', async (req, res) => {
             }
         }
 
-        // --- PROCESSAMENTO DOS DADOS PARA SALVAR NO FIRESTORE ---
         const orderItems = Array.isArray(orderDetails.order_items) ? orderDetails.order_items : [];
         let custoTotalML = 0;
         orderItems.forEach(item => {
             const sku = item.item?.seller_sku;
-            if (sku) custoTotalML += 0; // Pode ser ajustado se houver custo unitário
+            if (sku) custoTotalML += 0; 
         });
         const saleFee = orderItems.reduce((acc, item) => acc + (item.sale_fee || 0), 0);
         const cliente = orderDetails.buyer?.nickname || orderDetails.buyer?.first_name || 'Desconhecido';
@@ -440,7 +427,6 @@ router.get('/vendas/sync_for_account', async (req, res) => {
         let offset = 0;
         const limit = 50;
 
-        // Busca todas as vendas pagas
         while (true) {
             const url = `https://api.mercadolibre.com/orders/search?seller=${accountId}&order.status=paid&sort=date_desc&offset=${offset}&limit=${limit}`;
             const vendasRes = await fetch(url, { headers: { Authorization: `Bearer ${access_token}` } });
@@ -460,11 +446,9 @@ router.get('/vendas/sync_for_account', async (req, res) => {
             }
         }
 
-        // Busca nickname da conta
         const contaSnap = await db.collection('users').doc(uid).collection('mercadoLivre').doc(accountId).get();
         const nomeConta = contaSnap.exists ? contaSnap.data().nickname : `Conta ${accountId}`;
 
-        // Para cada venda, busca detalhes e salva no Firestore
         let salvos = 0;
         for (const venda of allResults) {
             try {
@@ -479,7 +463,6 @@ router.get('/vendas/sync_for_account', async (req, res) => {
                         const shipmentRes = await fetch(`https://api.mercadolibre.com/shipments/${orderDetails.shipping.id}`, { headers: { Authorization: `Bearer ${access_token}` } });
                         if (shipmentRes.ok) {
                             shipmentDetails = await shipmentRes.json();
-                            // A chamada para a função de cálculo agora usa a nova lógica com logs
                             shippingCost = typeof calcularFreteAdjust(orderDetails, shipmentDetails) === 'number' ? calcularFreteAdjust(orderDetails, shipmentDetails) : 0;
                         } else {
                             console.warn(`[ML Sync] Não foi possível buscar shipment para venda ${venda.id}. Salvando sem frete.`);
@@ -489,7 +472,6 @@ router.get('/vendas/sync_for_account', async (req, res) => {
                     }
                 }
 
-                // Processa os dados igual ao /vendas/detail/:orderId
                 const orderItems = Array.isArray(orderDetails.order_items) ? orderDetails.order_items : [];
                 let custoTotalML = 0;
                 orderItems.forEach(item => {
@@ -514,10 +496,9 @@ router.get('/vendas/sync_for_account', async (req, res) => {
                     txPlataforma: saleFee,
                     custoFrete: shippingCost,
                     custo: custoTotalML,
-                    seller_account_id: accountId // <-- identifica a conta da venda
+                    seller_account_id: accountId
                 };
 
-                // Salva SEMPRE em mlVendas, usando o id do pedido como ID do documento
                 await db.collection('users').doc(uid).collection('mlVendas').doc(orderDetails.id.toString()).set(vendaFinal, { merge: true });
                 salvos++;
             } catch (err) {

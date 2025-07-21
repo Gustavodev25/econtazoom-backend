@@ -5,15 +5,12 @@ const router = express.Router();
 const { db, admin } = require('../firebase');
 const multer = require('multer');
 
-// --- CONFIGURAÇÃO DE UPLOAD ---
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
-// --- CONSTANTES BLING ---
 const BLING_CLIENT_ID = process.env.BLING_CLIENT_ID || '57f339b6be5fdc0d986c1170b709b8d82ece3a76';
 const BLING_CLIENT_SECRET = process.env.BLING_CLIENT_SECRET || '5f59f5f4610f20bfd74984f151bcca343cb1375d68cc27216c4b2bc8a97d';
 
-// --- FUNÇÕES AUXILIARES DE AUTENTICAÇÃO ---
 
 async function getValidToken(uid) {
     const userDoc = await db.collection('users').doc(uid).get();
@@ -71,8 +68,6 @@ async function refreshToken(bling, uid) {
     }
 }
 
-// --- ROTAS PARA BUSCAR DADOS DO FIRESTORE ---
-
 async function getFirestoreData(req, res, collectionName) {
     const { uid } = req.query;
     if (!uid) {
@@ -114,8 +109,6 @@ router.get('/status', async (req, res) => {
         res.status(500).json({ success: false, connected: false, error: 'Erro ao verificar status.' });
     }
 });
-
-// --- LÓGICA DE SINCRONIZAÇÃO COM O BLING ---
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -268,14 +261,12 @@ async function saveItemsInBatches(uid, items, collectionName, dataType, lookups)
     console.log(`[Sync Save] ${batches.length} lotes para ${collectionName} salvos (${items.length} itens).`);
 }
 
-// CORRIGIDO: Função de sincronização otimizada para não travar
 async function syncDataType(uid, accessToken, dataType, apiPath, collectionName, lookups = {}) {
     const nomeAmigavel = dataType.replace('-', ' ');
     console.log(`[Sync] Iniciando sincronização de ${nomeAmigavel} para UID: ${uid}`);
 
     const isAccountSync = dataType === 'contas-pagar' || dataType === 'contas-receber';
 
-    // 1. Buscar IDs já salvos no Firestore
     const savedIds = new Set();
     if (isAccountSync) {
         await updateSyncStatus(uid, { syncing: true, message: `Verificando registros de ${nomeAmigavel} já salvos...`, dataType });
@@ -288,7 +279,6 @@ async function syncDataType(uid, accessToken, dataType, apiPath, collectionName,
         }
     }
 
-    // 2. Buscar a lista completa de itens do Bling
     let pagina = 1;
     let hasMoreData = true;
     const allItemsFromList = [];
@@ -309,7 +299,6 @@ async function syncDataType(uid, accessToken, dataType, apiPath, collectionName,
         }
     }
 
-    // 3. Filtrar apenas os itens novos que precisam ser processados
     const itemsToProcess = allItemsFromList.filter(item => !savedIds.has(String(item.id)));
     const totalItemsToProcess = itemsToProcess.length;
     const alreadySyncedCount = allItemsFromList.length - totalItemsToProcess;
@@ -324,13 +313,11 @@ async function syncDataType(uid, accessToken, dataType, apiPath, collectionName,
 
     console.log(`[Sync] Total de itens na lista do Bling: ${allItemsFromList.length}. Itens novos para processar: ${totalItemsToProcess}. Já sincronizados: ${alreadySyncedCount}.`);
 
-    // Para dados simples como categorias, salva tudo de uma vez e retorna
     if (!isAccountSync) {
         await saveItemsInBatches(uid, itemsToProcess, collectionName, dataType, lookups);
         return;
     }
 
-    // 4. Iniciar processamento detalhado com workers e atualizador de status
     const CONCURRENCY_LIMIT = 10;
     const AVERAGE_REQUEST_TIME_MS = 600;
     const BATCH_SAVE_SIZE = 50;
@@ -393,7 +380,6 @@ async function syncDataType(uid, accessToken, dataType, apiPath, collectionName,
     }
 
     try {
-        // Inicia o atualizador de status que roda a cada 2 segundos
         statusUpdater = setInterval(() => {
             const elapsedSeconds = (Date.now() - syncStartTime) / 1000;
             const timePerItem = itemsProcessed > 0 ? elapsedSeconds / itemsProcessed : (AVERAGE_REQUEST_TIME_MS / 1000);
@@ -411,16 +397,14 @@ async function syncDataType(uid, accessToken, dataType, apiPath, collectionName,
 
         const workers = Array.from({ length: CONCURRENCY_LIMIT }, () => worker());
         await Promise.all(workers);
-        await saveBatch(); // Salva o lote final
+        await saveBatch(); 
 
     } finally {
-        // Garante que o atualizador de status seja sempre parado
         if (statusUpdater) {
             clearInterval(statusUpdater);
         }
     }
 
-    // Envia uma atualização final para garantir que a contagem chegue a 100%
     await updateSyncStatus(uid, {
         syncing: true,
         message: `Finalizando sincronização de ${nomeAmigavel}...`,
@@ -474,7 +458,6 @@ async function startSingleSync(uid, dataType) {
         }
 
         await updateSyncStatus(uid, { syncing: false, message: finalMessage, completedAt: new Date().toISOString(), dataType });
-        // Aumentado o tempo para o usuário poder ler a mensagem final
         setTimeout(() => updateSyncStatus(uid, null), 15000);
     } catch (error) {
         console.error(`[Sync] Erro na sincronização de ${dataType} para UID ${uid}:`, error.message);
