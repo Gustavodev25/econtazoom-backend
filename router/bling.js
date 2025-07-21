@@ -108,7 +108,7 @@ router.get('/status', async (req, res) => {
         res.status(200).json({
             success: true,
             connected: !!(blingData && blingData.access_token),
-            bling: blingData || null  // Adicionando os dados completos do Bling
+            bling: blingData || null
         });
     } catch (error) {
         res.status(500).json({ success: false, connected: false, error: 'Erro ao verificar status.' });
@@ -120,29 +120,38 @@ router.get('/status', async (req, res) => {
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function requestWithRetry(url, headers, maxRetries = 5) {
-    let retries = 0;
-    while (retries < maxRetries) {
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            console.log(`[RequestWithRetry] Tentando acessar: ${url} (Tentativa ${retries + 1})`);
+            console.log(`[RequestWithRetry] Tentando acessar: ${url} (Tentativa ${attempt}/${maxRetries})`);
             const response = await axios.get(url, { headers, timeout: 30000 });
             console.log(`[RequestWithRetry] Sucesso: ${url}`);
             return response;
         } catch (error) {
-            if (error.code === 'ECONNABORTED') {
-                console.error(`[RequestWithRetry] Timeout na requisição: ${url}`);
-            }
-            if (error.response?.status === 429) {
-                retries++;
-                const waitTime = Math.min(Math.pow(2, retries) * 1000, 10000);
-                console.warn(`[Rate Limit] Limite da API atingido. Tentando novamente em ${waitTime / 1000}s...`);
+            lastError = error;
+            const retryableErrorCodes = ['ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN'];
+            const isNetworkError = retryableErrorCodes.includes(error.code);
+            const isRateLimitError = error.response?.status === 429;
+
+            if (isNetworkError || isRateLimitError) {
+                if (attempt === maxRetries) {
+                    break; 
+                }
+                const waitTime = Math.min(Math.pow(2, attempt) * 1000, 15000); 
+                const reason = isRateLimitError ? `Limite da API (429)` : `Erro de rede (${error.code})`;
+                
+                console.warn(`[RequestWithRetry] ${reason}. Tentando novamente em ${waitTime / 1000}s...`);
                 await delay(waitTime);
             } else {
+                console.error(`[RequestWithRetry] Erro não recuperável em ${url}:`, error.message);
                 throw error;
             }
         }
     }
-    throw new Error(`[Rate Limit] Falha após ${maxRetries} tentativas.`);
+    console.error(`[RequestWithRetry] Falha final após ${maxRetries} tentativas para ${url}. Último erro:`, lastError.message);
+    throw new Error(`Falha ao acessar ${url} após ${maxRetries} tentativas. Último erro: ${lastError.message}`);
 }
+
 
 async function fetchAllLookups(accessToken) {
     const lookups = {
@@ -226,7 +235,6 @@ function mapBlingToFirestore(item, dataType, lookups = {}) {
     };
 }
 
-// ATUALIZADO: Aceita um payload de objeto para mais detalhes de estado
 async function updateSyncStatus(uid, payload) {
     if (!uid) return;
     try {
@@ -245,7 +253,7 @@ async function updateSyncStatus(uid, payload) {
 }
 
 async function saveItemsInBatches(uid, items, collectionName, dataType, lookups) {
-    const batchSize = 500; // Firestore batch limit
+    const batchSize = 500;
     const batches = [];
     for (let i = 0; i < items.length; i += batchSize) {
         const batch = db.batch();
@@ -261,23 +269,38 @@ async function saveItemsInBatches(uid, items, collectionName, dataType, lookups)
     console.log(`[Sync Save] ${batches.length} lotes para ${collectionName} salvos (${items.length} itens).`);
 }
 
-// ATUALIZADO: Todas as chamadas para updateSyncStatus agora enviam um objeto
+// FUNÇÃO DE SINCRONIZAÇÃO ATUALIZADA PARA SER RESUMÍVEL
 async function syncDataType(uid, accessToken, dataType, apiPath, collectionName, lookups = {}) {
     const nomeAmigavel = dataType.replace('-', ' ');
     console.log(`[Sync] Iniciando sincronização de ${nomeAmigavel} para UID: ${uid}`);
+
+    const isAccountSync = dataType === 'contas-pagar' || dataType === 'contas-receber';
+
+    // 1. Verifica quais IDs já foram salvos no Firestore para este tipo de dado.
+    const savedIds = new Set();
+    if (isAccountSync) {
+        await updateSyncStatus(uid, { syncing: true, message: `Verificando registros de ${nomeAmigavel} já salvos...` });
+        try {
+            const snapshot = await db.collection('users').doc(uid).collection(collectionName).get();
+            snapshot.forEach(doc => savedIds.add(doc.id));
+            console.log(`[Sync Check] Encontrados ${savedIds.size} registros de ${nomeAmigavel} pré-existentes.`);
+        } catch (e) {
+            console.error(`[Sync Check] Erro ao verificar registros existentes para ${collectionName}:`, e);
+        }
+    }
+
+    // 2. Busca a lista completa de itens do Bling.
     let pagina = 1;
     let hasMoreData = true;
-    const allItems = [];
-    const limitePorPagina = 100;
-
+    const allItemsFromList = [];
     while (hasMoreData) {
         try {
-            await updateSyncStatus(uid, { syncing: true, message: `Sincronização: Buscando ${nomeAmigavel}, página ${pagina}...` });
-            const listUrl = `https://www.bling.com.br/Api/v3${apiPath}?pagina=${pagina}&limite=${limitePorPagina}`;
+            await updateSyncStatus(uid, { syncing: true, message: `Buscando lista de ${nomeAmigavel}, página ${pagina}...` });
+            const listUrl = `https://www.bling.com.br/Api/v3${apiPath}?pagina=${pagina}&limite=100`;
             const listResponse = await requestWithRetry(listUrl, { 'Authorization': `Bearer ${accessToken}` });
             const items = listResponse.data?.data || [];
-            allItems.push(...items);
-            hasMoreData = items.length === limitePorPagina;
+            allItemsFromList.push(...items);
+            hasMoreData = items.length === 100;
             pagina++;
             if (hasMoreData) await delay(200);
         } catch (error) {
@@ -287,48 +310,71 @@ async function syncDataType(uid, accessToken, dataType, apiPath, collectionName,
         }
     }
 
-    if (allItems.length === 0) {
-        console.log(`[Sync] Nenhum item encontrado para ${nomeAmigavel}.`);
+    // 3. Filtra para obter apenas os itens que ainda não foram salvos.
+    const itemsToProcess = allItemsFromList.filter(item => !savedIds.has(String(item.id)));
+
+    if (itemsToProcess.length === 0) {
+        console.log(`[Sync] Nenhum item novo de ${nomeAmigavel} para sincronizar.`);
+        // Para lookups, mesmo sem itens novos, garantimos que a coleção esteja atualizada.
+        if (!isAccountSync) {
+             await saveItemsInBatches(uid, allItemsFromList, collectionName, dataType, lookups);
+        }
         return;
     }
 
-    const isAccountSync = dataType === 'contas-pagar' || dataType === 'contas-receber';
+    console.log(`[Sync] Total de itens na lista do Bling: ${allItemsFromList.length}. Itens novos para processar: ${itemsToProcess.length}.`);
+
+    // Para categorias e formas de pagamento, a lista já contém todos os dados. Salva tudo de uma vez.
     if (!isAccountSync) {
-        await saveItemsInBatches(uid, allItems, collectionName, dataType, lookups);
+        await saveItemsInBatches(uid, itemsToProcess, collectionName, dataType, lookups);
         return;
     }
 
-    console.log(`[Sync Detail] Processando detalhes para ${allItems.length} itens de ${nomeAmigavel}...`);
-    const CONCURRENCY_LIMIT = 15;
-    const BATCH_SAVE_SIZE = 100;
-    const queue = [...allItems];
+    // 4. Para contas, busca os detalhes dos itens novos e salva em lotes contínuos.
+    const CONCURRENCY_LIMIT = 10;
+    const BATCH_SAVE_SIZE = 50; // Salva no Firestore a cada 50 itens processados.
+    const queue = [...itemsToProcess];
+    const totalItemsToProcess = itemsToProcess.length;
     let itemsProcessed = 0;
-    const totalItems = allItems.length;
-    let batchItems = [];
+    
+    const detailedItemsToSave = [];
+    const lock = { isSaving: false }; // Lock para evitar escritas simultâneas no banco.
+
+    const saveBatch = async () => {
+        if (lock.isSaving || detailedItemsToSave.length === 0) return;
+
+        lock.isSaving = true;
+        const batchToSave = detailedItemsToSave.splice(0, detailedItemsToSave.length);
+        
+        try {
+            await saveItemsInBatches(uid, batchToSave, collectionName, dataType, lookups);
+            console.log(`[Sync Save] Lote de ${batchToSave.length} itens de ${nomeAmigavel} salvo.`);
+        } catch (e) {
+            console.error(`[Sync Save] Erro ao salvar lote:`, e);
+            // Devolve os itens para o array para tentar salvar novamente.
+            detailedItemsToSave.unshift(...batchToSave);
+        } finally {
+            lock.isSaving = false;
+        }
+    };
 
     async function worker() {
         while (queue.length > 0) {
-            const item = queue.shift();
-            if (!item) continue;
+            const itemFromList = queue.shift();
+            if (!itemFromList) continue;
             try {
-                const response = await requestWithRetry(`https://www.bling.com.br/Api/v3${apiPath}/${item.id}`, { 'Authorization': `Bearer ${accessToken}` });
+                const response = await requestWithRetry(`https://www.bling.com.br/Api/v3${apiPath}/${itemFromList.id}`, { 'Authorization': `Bearer ${accessToken}` });
                 if (response?.data?.data) {
-                    batchItems.push(response.data.data);
+                    detailedItemsToSave.push(response.data.data);
                 }
             } catch (error) {
-                console.error(`[Sync Detail] Erro ao buscar detalhe do item ${item.id}:`, error.message);
+                console.error(`[Sync Detail] Erro ao buscar detalhe do item ${itemFromList.id}:`, error.message);
             }
             itemsProcessed++;
-            if (batchItems.length >= BATCH_SAVE_SIZE || itemsProcessed === totalItems) {
-                if (batchItems.length > 0) {
-                    await updateSyncStatus(uid, { syncing: true, message: `Sincronização: Salvando lote de ${batchItems.length} registros de ${nomeAmigavel} (${itemsProcessed}/${totalItems})...` });
-                    await saveItemsInBatches(uid, batchItems, collectionName, dataType, lookups);
-                    console.log(`[Sync Detail] Lote de ${batchItems.length} itens salvo (${itemsProcessed}/${totalItems}).`);
-                    batchItems = [];
-                }
-            }
-            if (itemsProcessed % 100 === 0 || itemsProcessed === totalItems) {
-                await updateSyncStatus(uid, { syncing: true, message: `Sincronização: Processando ${itemsProcessed}/${totalItems} de ${nomeAmigavel}...` });
+            await updateSyncStatus(uid, { syncing: true, message: `Processando ${itemsProcessed}/${totalItemsToProcess} de ${nomeAmigavel}...` });
+
+            if (detailedItemsToSave.length >= BATCH_SAVE_SIZE) {
+                await saveBatch();
             }
         }
     }
@@ -336,14 +382,12 @@ async function syncDataType(uid, accessToken, dataType, apiPath, collectionName,
     const workers = Array.from({ length: CONCURRENCY_LIMIT }, () => worker());
     await Promise.all(workers);
 
-    if (batchItems.length > 0) {
-        await updateSyncStatus(uid, { syncing: true, message: `Sincronização: Salvando lote final de ${batchItems.length} registros de ${nomeAmigavel}...` });
-        await saveItemsInBatches(uid, batchItems, collectionName, dataType, lookups);
-        console.log(`[Sync Detail] Lote final de ${batchItems.length} itens salvo.`);
-    }
+    // Garante que o último lote seja salvo.
+    await saveBatch();
 
-    console.log(`[Sync Detail] Processamento concluído. ${itemsProcessed} itens processados.`);
+    console.log(`[Sync Detail] Processamento de ${nomeAmigavel} concluído. ${itemsProcessed} itens processados.`);
 }
+
 
 const syncConfig = {
     'contas-pagar': { path: '/contas/pagar', collection: 'blingContasPagar' },
@@ -352,9 +396,8 @@ const syncConfig = {
     'formas-pagamentos': { path: '/formas-pagamentos', collection: 'blingFormasPagamentos' },
 };
 
-// ATUALIZADO: Orquestra todo o processo de sincronização com estados claros
 async function startSingleSync(uid, dataType) {
-    const nomeAmigavel = dataType.replace('-', ' ');
+    const nomeAmigavel = dataType.replace(/-/g, ' ');
     console.log(`[Sync] Requisição de sincronização para ${dataType} (UID: ${uid})`);
     try {
         await updateSyncStatus(uid, { syncing: true, message: `Iniciando sincronização de ${nomeAmigavel}...` });
@@ -378,7 +421,6 @@ async function startSingleSync(uid, dataType) {
 
         let finalMessage = `Sincronização de ${nomeAmigavel} concluída!`;
 
-        // Lógica de encadeamento para Contas a Pagar -> Contas a Receber
         if (dataType === 'contas-pagar') {
             await updateSyncStatus(uid, { syncing: true, message: 'Contas a Pagar concluído. Iniciando Contas a Receber...' });
             const receberConfig = syncConfig['contas-receber'];
@@ -386,12 +428,12 @@ async function startSingleSync(uid, dataType) {
             finalMessage = 'Sincronização de Contas a Pagar e a Receber concluída!';
         }
 
-        await updateSyncStatus(uid, { syncing: false, message: finalMessage });
+        await updateSyncStatus(uid, { syncing: false, message: finalMessage, completedAt: new Date().toISOString() });
         setTimeout(() => updateSyncStatus(uid, null), 8000);
     } catch (error) {
         console.error(`[Sync] Erro na sincronização de ${dataType} para UID ${uid}:`, error.message);
-        await updateSyncStatus(uid, { syncing: false, message: `Erro na sincronização de ${nomeAmigavel}.` });
-        setTimeout(() => updateSyncStatus(uid, null), 10000);
+        await updateSyncStatus(uid, { syncing: false, message: `Erro na sincronização de ${nomeAmigavel}. Por favor, tente novamente.`, error: true });
+        setTimeout(() => updateSyncStatus(uid, null), 10000); 
         throw error;
     }
 }
@@ -402,9 +444,8 @@ router.post('/sync/single', async (req, res) => {
         return res.status(400).json({ error: 'UID e dataType são obrigatórios' });
     }
 
-    // Inicia o processo em segundo plano sem travar a resposta
     startSingleSync(uid, dataType).catch(err => {
-        console.error(`[Sync Route] Erro na sincronização de ${dataType} (UID: ${uid}):`, err);
+        console.error(`[Sync Route] Erro na sincronização de ${dataType} (UID: ${uid}):`, err.message);
     });
 
     res.status(202).json({
