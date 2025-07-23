@@ -1,3 +1,5 @@
+// index.js (Seu arquivo atual, SEM ALTERAÇÕES NECESSÁRIAS AQUI)
+
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
@@ -10,7 +12,7 @@ const { db } = require('./firebase');
 
 const app = express();
 
-app.use(cors());
+app.use(cors()); // Esta linha é duplicada, mas não causa erro grave, apenas uma observação.
 app.use(bodyParser.json({ limit: '20mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '20mb' }));
 
@@ -46,6 +48,7 @@ app.use((req, res, next) => {
   next();
 });
 
+// A ROTA ABAIXO É CRUCIAL PARA O FRONTEND OBTER A URL DO NGROK
 app.get('/api/ngrok-url', (req, res) => {
   const ngrokUrl = req.app.locals.ngrokUrl || 'http://localhost:3001';
   res.json({ url: ngrokUrl });
@@ -53,7 +56,7 @@ app.get('/api/ngrok-url', (req, res) => {
 
 app.get('/api/ngrok-debug', (req, res) => {
   res.json({
-    ngrokUrl: req.app.locals.ngrokUrl, 
+    ngrokUrl: req.app.locals.ngrokUrl, // Usa req.app.locals para consistência
     node_env: process.env.NODE_ENV,
     usandoNgrok: !!req.app.locals.ngrokUrl,
     mensagem: req.app.locals.ngrokUrl
@@ -76,7 +79,7 @@ db.collection('test')
     console.error('Erro ao autenticar no Firestore:', err);
   });
 
-let ngrokUrl = null;
+let ngrokUrl = null; // Esta variável local é usada para armazenar a URL do ngrok temporariamente antes de ser atribuída a app.locals
 
 async function startServer() {
   try {
@@ -90,8 +93,8 @@ async function startServer() {
         proto: 'http'
       });
       if (ngrokUrl.endsWith('/')) ngrokUrl = ngrokUrl.slice(0, -1);
-      app.locals.ngrokUrl = ngrokUrl; 
-      NGROK.url = ngrokUrl; 
+      app.locals.ngrokUrl = ngrokUrl; // Variável global do app para acesso em outras rotas
+      NGROK.url = ngrokUrl; // Se NGROK é um objeto compartilhado entre routers
       console.log('Servidor rodando!');
       console.log('Acesse via ngrok:', ngrokUrl);
     } else {

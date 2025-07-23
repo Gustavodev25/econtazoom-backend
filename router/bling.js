@@ -5,12 +5,15 @@ const router = express.Router();
 const { db, admin } = require('../firebase');
 const multer = require('multer');
 
+// --- CONFIGURAÇÃO DE UPLOAD ---
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
+// --- CONSTANTES BLING ---
 const BLING_CLIENT_ID = process.env.BLING_CLIENT_ID || '57f339b6be5fdc0d986c1170b709b8d82ece3a76';
 const BLING_CLIENT_SECRET = process.env.BLING_CLIENT_SECRET || '5f59f5f4610f20bfd74984f151bcca343cb1375d68cc27216c4b2bc8a97d';
 
+// --- FUNÇÕES AUXILIARES DE AUTENTICAÇÃO ---
 
 async function getValidToken(uid) {
     const userDoc = await db.collection('users').doc(uid).get();
@@ -68,6 +71,8 @@ async function refreshToken(bling, uid) {
     }
 }
 
+// --- ROTAS PARA BUSCAR DADOS DO FIRESTORE ---
+
 async function getFirestoreData(req, res, collectionName) {
     const { uid } = req.query;
     if (!uid) {
@@ -110,6 +115,8 @@ router.get('/status', async (req, res) => {
     }
 });
 
+// --- LÓGICA DE SINCRONIZAÇÃO COM O BLING ---
+
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function requestWithRetry(url, headers, maxRetries = 5) {
@@ -126,11 +133,11 @@ async function requestWithRetry(url, headers, maxRetries = 5) {
 
             if (isNetworkError || isRateLimitError) {
                 if (attempt === maxRetries) {
-                    break;
+                    break; 
                 }
-                const waitTime = Math.min(Math.pow(2, attempt) * 1000, 15000);
+                const waitTime = Math.min(Math.pow(2, attempt) * 1000, 15000); 
                 const reason = isRateLimitError ? `Limite da API (429)` : `Erro de rede (${error.code})`;
-
+                
                 console.warn(`[RequestWithRetry] ${reason}. Tentando novamente em ${waitTime / 1000}s...`);
                 await delay(waitTime);
             } else {
@@ -226,6 +233,7 @@ function mapBlingToFirestore(item, dataType, lookups = {}) {
     };
 }
 
+// ATUALIZADO: Função para atualizar o status de sincronização com merge
 async function updateSyncStatus(uid, payload) {
     if (!uid) return;
     try {
@@ -261,6 +269,7 @@ async function saveItemsInBatches(uid, items, collectionName, dataType, lookups)
     console.log(`[Sync Save] ${batches.length} lotes para ${collectionName} salvos (${items.length} itens).`);
 }
 
+// ATUALIZADO: Função de sincronização com mensagem de continuação
 async function syncDataType(uid, accessToken, dataType, apiPath, collectionName, lookups = {}) {
     const nomeAmigavel = dataType.replace('-', ' ');
     console.log(`[Sync] Iniciando sincronização de ${nomeAmigavel} para UID: ${uid}`);
@@ -271,7 +280,7 @@ async function syncDataType(uid, accessToken, dataType, apiPath, collectionName,
     if (isAccountSync) {
         await updateSyncStatus(uid, { syncing: true, message: `Verificando registros de ${nomeAmigavel} já salvos...`, dataType });
         try {
-            const snapshot = await db.collection('users').doc(uid).collection(collectionName).get({ fields: [] }); // Apenas IDs
+            const snapshot = await db.collection('users').doc(uid).collection(collectionName).get();
             snapshot.forEach(doc => savedIds.add(doc.id));
             console.log(`[Sync Check] Encontrados ${savedIds.size} registros de ${nomeAmigavel} pré-existentes.`);
         } catch (e) {
@@ -306,7 +315,7 @@ async function syncDataType(uid, accessToken, dataType, apiPath, collectionName,
     if (totalItemsToProcess === 0) {
         console.log(`[Sync] Nenhum item novo de ${nomeAmigavel} para sincronizar.`);
         if (!isAccountSync) {
-            await saveItemsInBatches(uid, allItemsFromList, collectionName, dataType, lookups);
+             await saveItemsInBatches(uid, allItemsFromList, collectionName, dataType, lookups);
         }
         return;
     }
@@ -317,23 +326,24 @@ async function syncDataType(uid, accessToken, dataType, apiPath, collectionName,
         await saveItemsInBatches(uid, itemsToProcess, collectionName, dataType, lookups);
         return;
     }
-
+    
     const CONCURRENCY_LIMIT = 10;
     const AVERAGE_REQUEST_TIME_MS = 600;
     const BATCH_SAVE_SIZE = 50;
     const queue = [...itemsToProcess];
-
+    
     let itemsProcessed = 0;
     const syncStartTime = Date.now();
-
+    
     const initialEstimateSeconds = Math.ceil((totalItemsToProcess / CONCURRENCY_LIMIT) * (AVERAGE_REQUEST_TIME_MS / 1000));
-    let initialMessage = `Processando ${totalItemsToProcess} ${nomeAmigavel}...`;
+    
+    let initialMessage = `Processando ${nomeAmigavel}...`;
     if (alreadySyncedCount > 0) {
-        initialMessage = `Continuando sincronização: ${totalItemsToProcess} novos ${nomeAmigavel}...`;
+        initialMessage = `Continuando sincronização de ${nomeAmigavel}...`;
     }
 
-    await updateSyncStatus(uid, {
-        syncing: true,
+    await updateSyncStatus(uid, { 
+        syncing: true, 
         message: initialMessage,
         dataType: dataType,
         itemsProcessed: 0,
@@ -343,7 +353,6 @@ async function syncDataType(uid, accessToken, dataType, apiPath, collectionName,
 
     const detailedItemsToSave = [];
     const lock = { isSaving: false };
-    let statusUpdater = null;
 
     const saveBatch = async () => {
         if (lock.isSaving || detailedItemsToSave.length === 0) return;
@@ -373,46 +382,28 @@ async function syncDataType(uid, accessToken, dataType, apiPath, collectionName,
             }
             itemsProcessed++;
 
+            const elapsedSeconds = (Date.now() - syncStartTime) / 1000;
+            const timePerItem = itemsProcessed > 0 ? elapsedSeconds / itemsProcessed : (AVERAGE_REQUEST_TIME_MS / 1000);
+            const remainingSeconds = Math.round((totalItemsToProcess - itemsProcessed) * timePerItem);
+
+            await updateSyncStatus(uid, { 
+                syncing: true, 
+                message: `Processando ${nomeAmigavel}...`,
+                dataType: dataType,
+                itemsProcessed: itemsProcessed,
+                totalItems: totalItemsToProcess,
+                estimatedSeconds: remainingSeconds
+            });
+
             if (detailedItemsToSave.length >= BATCH_SAVE_SIZE) {
                 await saveBatch();
             }
         }
     }
 
-    try {
-        statusUpdater = setInterval(() => {
-            const elapsedSeconds = (Date.now() - syncStartTime) / 1000;
-            const timePerItem = itemsProcessed > 0 ? elapsedSeconds / itemsProcessed : (AVERAGE_REQUEST_TIME_MS / 1000);
-            const remainingSeconds = Math.round((totalItemsToProcess - itemsProcessed) * timePerItem);
-
-            updateSyncStatus(uid, {
-                syncing: true,
-                message: `Processando ${nomeAmigavel}...`,
-                dataType: dataType,
-                itemsProcessed: itemsProcessed,
-                totalItems: totalItemsToProcess,
-                estimatedSeconds: remainingSeconds
-            }).catch(err => console.error("[Status Updater] Erro:", err));
-        }, 2000);
-
-        const workers = Array.from({ length: CONCURRENCY_LIMIT }, () => worker());
-        await Promise.all(workers);
-        await saveBatch(); 
-
-    } finally {
-        if (statusUpdater) {
-            clearInterval(statusUpdater);
-        }
-    }
-
-    await updateSyncStatus(uid, {
-        syncing: true,
-        message: `Finalizando sincronização de ${nomeAmigavel}...`,
-        dataType: dataType,
-        itemsProcessed: totalItemsToProcess,
-        totalItems: totalItemsToProcess,
-        estimatedSeconds: 0
-    });
+    const workers = Array.from({ length: CONCURRENCY_LIMIT }, () => worker());
+    await Promise.all(workers);
+    await saveBatch();
 
     console.log(`[Sync Detail] Processamento de ${nomeAmigavel} concluído. ${itemsProcessed} itens processados.`);
 }
@@ -451,18 +442,18 @@ async function startSingleSync(uid, dataType) {
         let finalMessage = `Sincronização de ${nomeAmigavel} concluída!`;
 
         if (dataType === 'contas-pagar') {
-            await updateSyncStatus(uid, { syncing: true, message: 'Contas a Pagar concluído. Iniciando Contas a Receber...', dataType: 'contas-receber' });
+            await updateSyncStatus(uid, { syncing: true, message: 'Contas a Pagar concluído. Iniciando Contas a Receber...', dataType });
             const receberConfig = syncConfig['contas-receber'];
             await syncDataType(uid, accessToken, 'contas-receber', receberConfig.path, receberConfig.collection, lookups);
             finalMessage = 'Sincronização de Contas a Pagar e a Receber concluída!';
         }
 
         await updateSyncStatus(uid, { syncing: false, message: finalMessage, completedAt: new Date().toISOString(), dataType });
-        setTimeout(() => updateSyncStatus(uid, null), 15000);
+        setTimeout(() => updateSyncStatus(uid, null), 8000);
     } catch (error) {
         console.error(`[Sync] Erro na sincronização de ${dataType} para UID ${uid}:`, error.message);
         await updateSyncStatus(uid, { syncing: false, message: `Erro na sincronização de ${nomeAmigavel}. Por favor, tente novamente.`, error: true, dataType });
-        setTimeout(() => updateSyncStatus(uid, null), 10000);
+        setTimeout(() => updateSyncStatus(uid, null), 10000); 
         throw error;
     }
 }

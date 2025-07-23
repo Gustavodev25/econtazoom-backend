@@ -4,18 +4,26 @@ const crypto = require('crypto');
 const axios = require('axios');
 const { db } = require('../firebase');
 
+// --- Configurações da API Shopee ---
 const CLIENT_ID = process.env.SHOPEE_CLIENT_ID || '2011925';
 const CLIENT_SECRET = process.env.SHOPEE_CLIENT_SECRET || 'shpk6b594c726471596464645a4a436b437867576462567a5758687647617448';
 const SHOPEE_BASE_URL = 'https://openplatform.shopee.com.br';
-const AXIOS_TIMEOUT = 30000; 
+const AXIOS_TIMEOUT = 30000; // 30 segundos de timeout para requisições
 
+/**
+ * Gera a assinatura HMAC-SHA256 para as requisições da API Shopee.
+ */
 function generateSign(path, partner_id, timestamp, access_token = '', shop_id = '') {
     const baseString = `${partner_id}${path}${timestamp}${access_token}${shop_id}`;
     return crypto.createHmac('sha256', CLIENT_SECRET).update(baseString).digest('hex');
 }
 
+// Helper para adicionar um delay entre chamadas de API
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+/**
+ * Renova o access_token da Shopee se ele estiver expirado.
+ */
 async function refreshTokenShopee(uid, shopId, accountData, forceRefresh = false) {
     try {
         if (!forceRefresh) {
@@ -74,6 +82,9 @@ async function refreshTokenShopee(uid, shopId, accountData, forceRefresh = false
     }
 }
 
+/**
+ * Obtém um token válido, tentando renová-lo se necessário.
+ */
 async function getValidTokenShopee(uid, shopId, forceRefresh = false) {
     const snap = await db.collection('users').doc(uid).collection('shopee').doc(shopId).get();
     if (!snap.exists) throw new Error(`Conta Shopee ${shopId} não encontrada.`);
@@ -90,6 +101,9 @@ async function getValidTokenShopee(uid, shopId, forceRefresh = false) {
         throw error;
     }
 }
+
+
+// --- Rotas da API ---
 
 router.get('/auth', (req, res) => {
     const { uid } = req.query;
@@ -236,6 +250,7 @@ router.get('/vendas/detail/:orderSn', async (req, res) => {
     try {
         const access_token = await getValidTokenShopee(uid, shopId);
 
+        // **MELHORIA**: Buscar o nome da conta para salvar junto com a venda.
         const contaSnap = await db.collection('users').doc(uid).collection('shopee').doc(shopId).get();
         const nomeConta = contaSnap.exists ? contaSnap.data().shop_name : `Loja ${shopId}`;
 
@@ -286,7 +301,7 @@ router.get('/vendas/detail/:orderSn', async (req, res) => {
             canalVenda: 'Shopee', idVendaMarketplace: order.order_sn,
             status: order.order_status || 'UNKNOWN', 
             shop_id: shopId,
-            nomeConta: nomeConta 
+            nomeConta: nomeConta // **MELHORIA**: Salva o nome da conta.
         };
         
         await db.collection('users').doc(uid).collection('shopeeVendas').doc(orderSn).set(venda, { merge: true });
