@@ -250,7 +250,6 @@ router.get('/vendas/detail/:orderSn', async (req, res) => {
     try {
         const access_token = await getValidTokenShopee(uid, shopId);
 
-        // **MELHORIA**: Buscar o nome da conta para salvar junto com a venda.
         const contaSnap = await db.collection('users').doc(uid).collection('shopee').doc(shopId).get();
         const nomeConta = contaSnap.exists ? contaSnap.data().shop_name : `Loja ${shopId}`;
 
@@ -299,9 +298,9 @@ router.get('/vendas/detail/:orderSn', async (req, res) => {
             dataHora: new Date((order.create_time || 0) * 1000).toISOString(),
             tracking_number: order.package_list?.[0]?.tracking_number || 'N/A',
             canalVenda: 'Shopee', idVendaMarketplace: order.order_sn,
-            status: order.order_status || 'UNKNOWN', 
+            status: (order.order_status || 'UNKNOWN').toUpperCase(),
             shop_id: shopId,
-            nomeConta: nomeConta // **MELHORIA**: Salva o nome da conta.
+            nomeConta: nomeConta
         };
         
         await db.collection('users').doc(uid).collection('shopeeVendas').doc(orderSn).set(venda, { merge: true });
@@ -315,19 +314,68 @@ router.get('/vendas/detail/:orderSn', async (req, res) => {
     }
 });
 
+
 router.get('/vendas', async (req, res) => {
-    const { uid } = req.query;
-    if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
+    const { uid, page = 1, pageSize = 7, sortBy = 'create_time', sortOrder = 'desc', status } = req.query;
+
+    if (!uid) {
+        return res.status(400).json({ error: 'UID do usuário é obrigatório.' });
+    }
+    
+    const pageNum = parseInt(page, 10);
+    const pageSizeNum = parseInt(pageSize, 10);
+
     try {
-        const vendasRef = db.collection('users').doc(uid).collection('shopeeVendas');
-        const snapshot = await vendasRef.orderBy('create_time', 'desc').get();
-        const todasAsVendas = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-        res.json(todasAsVendas);
+        let baseQuery = db.collection('users').doc(uid).collection('shopeeVendas');
+        
+        let query = baseQuery;
+        const statusFiltro = status && status !== 'todos' ? status.toUpperCase() : null;
+        if (statusFiltro) {
+            query = query.where('status', '==', statusFiltro);
+        }
+
+        const countSnapshot = await query.count().get();
+        const totalItems = countSnapshot.data().count;
+        const totalPages = Math.ceil(totalItems / pageSizeNum);
+
+        let dataQuery = query.orderBy(sortBy, sortOrder);
+
+        if (pageNum > 1) {
+            const offset = (pageNum - 1) * pageSizeNum;
+            dataQuery = dataQuery.offset(offset);
+        }
+        dataQuery = dataQuery.limit(pageSizeNum);
+
+        const snapshot = await dataQuery.get();
+        const vendasDaPagina = snapshot.docs.map(doc => {
+            const data = doc.data();
+            return {
+                id: doc.id,
+                status: data.status || data.order_status || 'UNKNOWN',
+                ...data
+            };
+        });
+
+        res.json({
+            vendas: vendasDaPagina,
+            pagination: {
+                currentPage: pageNum,
+                pageSize: pageSizeNum,
+                totalPages,
+                totalItems,
+            },
+        });
     } catch (error) {
-        console.error('[Shopee Cache Read] Erro ao buscar vendas do Firestore:', error.message);
-        res.status(500).json({ error: 'Erro ao buscar vendas do cache', detalhe: error.message });
+        // Log detalhado no console do backend. O erro do Firestore incluirá um link para criar o índice.
+        console.error(`[Firestore Query Error] Falha ao buscar vendas na coleção 'shopeeVendas'. Verifique o console para o link de criação do índice. Detalhes: ${error.message}`);
+        
+        // Retorna um erro 500 para o frontend, indicando uma falha no servidor.
+        res.status(500).json({
+            error: `Erro no servidor: A consulta ao banco de dados falhou. Provavelmente, um índice composto do Firestore está ausente. Verifique os logs do seu backend para encontrar um link e instruções para criar o índice necessário.`
+        });
     }
 });
+
 
 router.get('/contas', async (req, res) => {
     const { uid } = req.query;
