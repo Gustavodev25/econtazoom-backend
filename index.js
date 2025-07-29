@@ -1,10 +1,10 @@
-// index.js (Seu arquivo atual, SEM ALTERAÇÕES NECESSÁRIAS AQUI)
+// index.js
 
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const ngrok = require('ngrok');
-const { NGROK } = require('./router/mercadoLivre');
+const { NGROK } = require('./router/sharedState'); // ATUALIZADO: Importa do novo arquivo centralizado
 const mercadoLivreRouter = require('./router/mercadoLivre');
 const blingRouter = require('./router/bling');
 const shopeeRouter = require('./router/shopee'); 
@@ -12,7 +12,7 @@ const { db } = require('./firebase');
 
 const app = express();
 
-app.use(cors()); // Esta linha é duplicada, mas não causa erro grave, apenas uma observação.
+app.use(cors());
 app.use(bodyParser.json({ limit: '20mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '20mb' }));
 
@@ -44,25 +44,14 @@ app.use('/bling', blingRouter);
 app.use('/shopee', shopeeRouter);
 
 app.use((req, res, next) => {
-  console.log(`[Express] ${req.method} ${req.url} - Body:`, req.body, '- Query:', req.query);
+  console.log(`[Express] ${req.method} ${req.url} - Query:`, req.query);
   next();
 });
 
-// A ROTA ABAIXO É CRUCIAL PARA O FRONTEND OBTER A URL DO NGROK
+// Rota para o frontend descobrir a URL pública do backend (ngrok)
 app.get('/api/ngrok-url', (req, res) => {
-  const ngrokUrl = req.app.locals.ngrokUrl || 'http://localhost:3001';
+  const ngrokUrl = app.locals.ngrokUrl || `http://localhost:${PORT}`;
   res.json({ url: ngrokUrl });
-});
-
-app.get('/api/ngrok-debug', (req, res) => {
-  res.json({
-    ngrokUrl: req.app.locals.ngrokUrl, // Usa req.app.locals para consistência
-    node_env: process.env.NODE_ENV,
-    usandoNgrok: !!req.app.locals.ngrokUrl,
-    mensagem: req.app.locals.ngrokUrl
-      ? 'ngrok ATIVO. Backend acessível externamente.'
-      : 'ngrok NÃO está ativo. Backend só acessível localmente.'
-  });
 });
 
 app.get('/', (req, res) => {
@@ -79,7 +68,7 @@ db.collection('test')
     console.error('Erro ao autenticar no Firestore:', err);
   });
 
-let ngrokUrl = null; // Esta variável local é usada para armazenar a URL do ngrok temporariamente antes de ser atribuída a app.locals
+let ngrokUrl = null;
 
 async function startServer() {
   try {
@@ -93,8 +82,10 @@ async function startServer() {
         proto: 'http'
       });
       if (ngrokUrl.endsWith('/')) ngrokUrl = ngrokUrl.slice(0, -1);
-      app.locals.ngrokUrl = ngrokUrl; // Variável global do app para acesso em outras rotas
-      NGROK.url = ngrokUrl; // Se NGROK é um objeto compartilhado entre routers
+      
+      app.locals.ngrokUrl = ngrokUrl;
+      NGROK.url = ngrokUrl; // ATUALIZADO: Modifica o objeto compartilhado
+      
       console.log('Servidor rodando!');
       console.log('Acesse via ngrok:', ngrokUrl);
     } else {
@@ -102,7 +93,7 @@ async function startServer() {
       app.locals.ngrokUrl = null;
       NGROK.url = null;
       console.log('Servidor rodando!');
-      console.log('Acesse localmente em http://localhost:' + PORT);
+      console.log(`Acesse localmente em http://localhost:${PORT}`);
     }
 
     server.on('error', err => {
