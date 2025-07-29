@@ -477,8 +477,11 @@ async function processSingleOrderDetail(uid, accountId, token, orderDetails) {
             idVendaMarketplace: orderDetails.id?.toString(),
             canalVenda: 'Mercado Livre',
             status: orderDetails.status,
-            dataHora: orderDetails.date_created,
+            dataHora: orderDetails.date_created, // Mantido para referência
             date_created: orderDetails.date_created,
+            // *** CORREÇÃO ADICIONADA AQUI ***
+            // O campo 'date_closed' é essencial para os filtros de data no frontend.
+            date_closed: orderDetails.date_closed,
             cliente: cliente,
             nomeProdutoVendido: orderItems[0]?.item?.title || '-',
             valorTotalVenda: Number(orderDetails.total_amount || 0),

@@ -169,7 +169,7 @@ router.get('/check-updates', async (req, res) => {
             }
 
             try {
-                const newOrders = await getAllOrderSnForShop(uid, shopId, conta.lastSyncTimestamp);
+                const newOrders = await getAllOrderSnForShop(uid, shopId, conta.lastSyncTimestamp, Math.floor(Date.now() / 1000));
                 if (newOrders.length > 0) {
                     return { id: shopId, nome: shopName, status: 'needs_update', newOrdersCount: newOrders.length };
                 } else {
@@ -232,15 +232,15 @@ async function runFullShopeeSync(uid, singleShopId = null) {
         const isFirstSync = vendasSnapshot.empty;
 
         try {
+            const syncExecutionTime = Math.floor(Date.now() / 1000);
+
             await updateSyncStatus(uid, `Iniciando...`, 0, false, shopName);
             
-            const syncStartTime = Math.floor(Date.now() / 1000);
-
-            const orderSnList = await getAllOrderSnForShop(uid, shopId, isFirstSync ? null : conta.lastSyncTimestamp);
+            const orderSnList = await getAllOrderSnForShop(uid, shopId, isFirstSync ? null : conta.lastSyncTimestamp, syncExecutionTime);
             
             if (orderSnList.length === 0) {
                  if (!isFirstSync) {
-                    await shopRef.update({ lastSyncTimestamp: syncStartTime });
+                    await shopRef.update({ lastSyncTimestamp: syncExecutionTime });
                  }
                  await updateSyncStatus(uid, `Nenhum pedido novo encontrado.`, 100, false, shopName);
                  await delay(1500);
@@ -267,7 +267,8 @@ async function runFullShopeeSync(uid, singleShopId = null) {
                 await batch.commit();
             }
 
-            await shopRef.update({ lastSyncTimestamp: syncStartTime });
+            await shopRef.update({ lastSyncTimestamp: syncExecutionTime });
+
             await updateSyncStatus(uid, `Sincronização concluída!`, 100, false, shopName);
             await delay(1500);
         } catch (error) {
@@ -280,20 +281,20 @@ async function runFullShopeeSync(uid, singleShopId = null) {
     await updateSyncStatus(uid, `Processo finalizado.`, 100, false, 'Sistema');
 }
 
-async function getAllOrderSnForShop(uid, shopId, lastSyncTimestamp) {
+async function getAllOrderSnForShop(uid, shopId, lastSyncTimestamp, syncExecutionTime) {
     const allOrderSn = new Set();
     const path = '/api/v2/order/get_order_list';
-    const now = Math.floor(Date.now() / 1000);
     const isInitialSync = !lastSyncTimestamp;
     const time_range_field = isInitialSync ? 'create_time' : 'update_time';
     
     if (!isInitialSync) {
-        const time_from = lastSyncTimestamp - (60 * 10); // 10 min overlap
-        await fetchOrderListChunk(uid, shopId, path, time_from, now, time_range_field, allOrderSn);
+        const time_from = lastSyncTimestamp - (60 * 10); // 10 min de sobreposição para segurança
+        await fetchOrderListChunk(uid, shopId, path, time_from, syncExecutionTime, time_range_field, allOrderSn);
     } else {
         const totalLookbackDays = 90;
+        const initialSyncStartTime = syncExecutionTime; 
         for (let i = 0; i < totalLookbackDays / 15; i++) {
-            const time_to = now - (i * 15 * 24 * 60 * 60);
+            const time_to = initialSyncStartTime - (i * 15 * 24 * 60 * 60);
             const time_from = time_to - (15 * 24 * 60 * 60);
             await fetchOrderListChunk(uid, shopId, path, time_from, time_to, time_range_field, allOrderSn);
         }
@@ -370,7 +371,15 @@ async function getDetailsForChunk(uid, shopId, token, orderSnChunk) {
                 const escrowTimestamp = Math.floor(Date.now() / 1000);
                 const escrowSign = generateSign(escrowPath, CLIENT_ID, escrowTimestamp, token, shopId);
                 const escrowResponse = await axios.get(`${SHOPEE_BASE_URL}${escrowPath}`, { params: { partner_id: parseInt(CLIENT_ID), shop_id: parseInt(shopId), order_sn: order.order_sn, sign: escrowSign, timestamp: escrowTimestamp, access_token: token }, timeout: AXIOS_TIMEOUT });
+                
                 const escrow_detail = (!escrowResponse.data.error && escrowResponse.data.response) ? escrowResponse.data.response : null;
+                const incomeDetails = escrow_detail?.income_details;
+                
+                // *** CORREÇÃO ADICIONADA AQUI ***
+                // Cálculo das taxas e do frete com base nos dados de pagamento (escrow).
+                const txPlataforma = Math.abs(incomeDetails?.commission_fee || 0) + Math.abs(incomeDetails?.service_fee || 0);
+                const custoFrete = Math.abs(escrow_detail?.shipping_fee_info?.shipping_fee_seller_spend || 0);
+
                 const valorTotalVenda = (order.item_list || []).reduce((sum, it) => (sum + (parseFloat(it.model_discounted_price || it.model_original_price || 0) * parseInt(it.model_quantity_purchased || 0, 10))), 0);
                 
                 return { 
@@ -393,7 +402,11 @@ async function getDetailsForChunk(uid, shopId, token, orderSnChunk) {
                     cliente: order.recipient_address?.name || order.buyer_username || 'Desconhecido', 
                     nomeProdutoVendido: order.item_list?.[0]?.item_name || '-', 
                     valorTotalVenda: valorTotalVenda, 
-                    tracking_number: order.package_list?.[0]?.tracking_number || 'N/A' 
+                    tracking_number: order.package_list?.[0]?.tracking_number || 'N/A',
+                    // *** CORREÇÃO ADICIONADA AQUI ***
+                    // Salvando os novos campos calculados.
+                    txPlataforma: txPlataforma,
+                    custoFrete: custoFrete,
                 };
             } catch (escrowError) { 
                 console.warn(`[Shopee Escrow] Não foi possível buscar detalhes de pagamento para a venda ${order.order_sn}. Erro: ${escrowError.message}`);
