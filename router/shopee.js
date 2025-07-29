@@ -3,9 +3,8 @@ const router = express.Router();
 const crypto = require('crypto');
 const axios = require('axios');
 const { db } = require('../firebase');
-const { NGROK } = require('./sharedState'); // ATUALIZADO: Importa do novo arquivo centralizado
+const { NGROK } = require('./sharedState');
 
-// --- Configurações e Funções Auxiliares ---
 const CLIENT_ID = process.env.SHOPEE_CLIENT_ID || '2011925';
 const CLIENT_SECRET = process.env.SHOPEE_CLIENT_SECRET || 'shpk6b594c726471596464645a4a436b437867576462567a5758687647617448';
 const SHOPEE_BASE_URL = 'https://openplatform.shopee.com.br';
@@ -35,7 +34,6 @@ function cleanObject(obj) {
 }
 
 
-// --- Gerenciamento de Token ---
 async function refreshTokenShopee(uid, shopId, accountData, forceRefresh = false) {
     try {
         if (!forceRefresh) {
@@ -82,11 +80,9 @@ async function getValidTokenShopee(uid, shopId, forceRefresh = false) {
     return await refreshTokenShopee(uid, shopId, data, forceRefresh);
 }
 
-// --- Rotas de Autenticação e Dados ---
 router.get('/auth', (req, res) => {
     const { uid } = req.query;
     if (!uid) return res.status(400).send('UID do usuário é obrigatório.');
-    // ATUALIZADO: Usa a URL do ngrok (se disponível) ou a URL de produção como fallback
     const backendUrl = NGROK.url || 'https://econtazoom-backend.onrender.com'; 
     const redirectUri = `${backendUrl}/shopee/callback?uid=${uid}`;
     const timestamp = Math.floor(Date.now() / 1000);
@@ -119,8 +115,7 @@ router.get('/callback', async (req, res) => {
         res.send('<script>window.close();</script><h1>Autenticação concluída! Pode fechar esta janela.</h1>');
     } catch (error) { res.status(500).send(`Erro durante a autenticação: ${error.message}`); }
 });
-// --- O resto do arquivo permanece o mesmo ---
-// ... (cole o restante do seu arquivo shopee.js aqui)
+
 router.get('/contas', async (req, res) => {
     const { uid } = req.query;
     if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
@@ -153,7 +148,6 @@ router.get('/vendas', async (req, res) => {
   } catch (error) { res.status(500).json({ error: `Erro no servidor: A consulta ao banco de dados falhou. Detalhes: ${error.message}` }); }
 });
 
-// --- ENDPOINTS DE SINCRONIZAÇÃO ---
 router.get('/check-updates', async (req, res) => {
     const { uid } = req.query;
     if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
@@ -163,7 +157,7 @@ router.get('/check-updates', async (req, res) => {
 
         const statusPromises = contasSnap.docs.map(async (doc) => {
             const conta = { id: doc.id, ...doc.data() };
-            const shopId = conta.id; // É uma string
+            const shopId = conta.id; 
             const shopName = conta.shop_name;
 
             const vendasRef = db.collection('users').doc(uid).collection('shopeeVendas').where('shop_id', '==', shopId);
@@ -203,7 +197,6 @@ router.post('/sync-single-shop', (req, res) => {
     });
 });
 
-// --- ARQUITETURA DE SINCRONIZAÇÃO ---
 const updateSyncStatus = async (uid, message, progress = null, isError = false, shopName = '') => {
     const statusRef = db.collection('users').doc(uid).collection('shopee').doc('sync_status');
     const statusUpdate = { message, lastUpdate: new Date().toISOString(), isError, shopName };

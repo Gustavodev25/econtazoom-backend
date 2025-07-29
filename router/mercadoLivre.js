@@ -4,13 +4,12 @@ const crypto = require('crypto');
 const router = express.Router();
 const { db } = require('../firebase'); 
 const { FieldPath } = require('firebase-admin/firestore');
-const { NGROK } = require('./sharedState'); // ATUALIZADO: Importa do novo arquivo centralizado
+const { NGROK } = require('./sharedState'); 
 
 const CLIENT_ID = '4762241412857004';
 const CLIENT_SECRET = 'yBJNREOR3izbhIGRJtUP8P4FsGNXLIvB';
 const AXIOS_TIMEOUT = 30000;
 
-// --- Funções Auxiliares ---
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 function chunkArray(array, size) {
     const chunks = [];
@@ -36,8 +35,6 @@ function cleanObject(obj) {
     }, {});
 }
 
-
-// --- Lógica de Token ---
 async function refreshTokenML(uid, contaId, contaData) {
   try {
     const tokenResponse = await fetch('https://api.mercadolibre.com/oauth/token', {
@@ -70,11 +67,9 @@ async function getValidTokenML(uid, contaId) {
     return contaData.access_token;
 }
 
-// --- ROTAS DE AUTENTICAÇÃO ---
 router.get('/auth', (req, res) => {
     const { uid } = req.query;
     if (!uid) return res.status(400).send('UID do usuário é obrigatório.');
-    // ATUALIZADO: Usa a URL do ngrok (se disponível) ou a URL de produção como fallback
     const backendUrl = NGROK.url || 'https://econtazoom-backend.onrender.com';
     const redirectUri = `${backendUrl}/ml/callback`;
     const authUrl = new URL('https://auth.mercadolibre.com.br/authorization');
@@ -136,9 +131,6 @@ router.get('/callback', async (req, res) => {
     }
 });
 
-// --- O resto do arquivo permanece o mesmo ---
-// ... (cole o restante do seu arquivo mercadoLivre.js aqui)
-// --- ROTAS DE DADOS ---
 router.get('/contas', async (req, res) => {
     const { uid } = req.query;
     if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
@@ -183,8 +175,6 @@ router.get('/vendas-paginadas', async (req, res) => {
   } catch (error) { res.status(500).json({ error: `Erro no servidor: ${error.message}` }); }
 });
 
-
-// --- Sistema de Status de Sincronização ---
 const updateSyncStatus = async (uid, message, progress = null, isError = false, accountName = '') => {
     const statusRef = db.collection('users').doc(uid).collection('mercadoLivre').doc('sync_status');
     const statusUpdate = { message, lastUpdate: new Date().toISOString(), isError, accountName };
@@ -192,12 +182,11 @@ const updateSyncStatus = async (uid, message, progress = null, isError = false, 
     await statusRef.set(statusUpdate, { merge: true });
 };
 
-// --- Endpoints de Sincronização ---
 async function getNewlyCreatedOrderIds(uid, accountId, lastSyncTimestamp) {
     if (!lastSyncTimestamp) return [];
     const token = await getValidTokenML(uid, accountId);
     const dateFrom = new Date(lastSyncTimestamp * 1000);
-    dateFrom.setMinutes(dateFrom.getMinutes() - 20); // Margem de segurança
+    dateFrom.setMinutes(dateFrom.getMinutes() - 20); 
     const dateTo = new Date();
     return await fetchOrderIdsForDateRange(token, accountId, dateFrom, dateTo, 'last_updated');
 }
@@ -269,7 +258,6 @@ router.post('/sync-single-shop', (req, res) => {
     });
 });
 
-// --- LÓGICA CENTRAL DE SINCRONIZAÇÃO ---
 async function runFullMercadoLivreSync(uid, singleAccountId) {
     const contaRef = db.collection('users').doc(uid).collection('mercadoLivre').doc(singleAccountId);
     let conta, accountName;
@@ -336,8 +324,6 @@ async function runFullMercadoLivreSync(uid, singleAccountId) {
     }
 }
 
-
-// --- LÓGICA DE BUSCA DE PEDIDOS ---
 async function fetchOrderIdsForDateRange(token, sellerId, dateFrom, dateTo, filterField) {
     const ids = new Set();
     let offset = 0;
@@ -564,19 +550,19 @@ function calcularFreteAdjust(orderDetails, shippingDetails) {
     let finalCost = 0;
 
     switch (logisticType) {
-        case 'self_service': // FLEX (Receita para o vendedor)
+        case 'self_service':
             custoBruto = (unitPrice < 79) ? baseCost : (baseCost - listCost);
             finalCost = -custoBruto; 
             break;
 
         case 'drop_off':
-        case 'xd_drop_off': // Custo para o vendedor
+        case 'xd_drop_off':
             custoBruto = listCost - buyerCost;
             finalCost = Math.max(0, custoBruto);
             break;
 
         case 'fulfillment':
-        case 'cross_docking': // Custo para o vendedor
+        case 'cross_docking': 
             custoBruto = listCost;
             finalCost = Math.max(0, custoBruto);
             break;

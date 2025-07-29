@@ -5,15 +5,11 @@ const router = express.Router();
 const { db, admin } = require('../firebase');
 const multer = require('multer');
 
-// --- CONFIGURAÇÃO DE UPLOAD ---
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
-// --- CONSTANTES BLING ---
 const BLING_CLIENT_ID = process.env.BLING_CLIENT_ID || '57f339b6be5fdc0d986c1170b709b8d82ece3a76';
 const BLING_CLIENT_SECRET = process.env.BLING_CLIENT_SECRET || '5f59f5f4610f20bfd74984f151bcca343cb1375d68cc27216c4b2bc8a97d';
-
-// --- FUNÇÕES AUXILIARES DE AUTENTICAÇÃO ---
 
 async function getValidToken(uid) {
     const userDoc = await db.collection('users').doc(uid).get();
@@ -71,8 +67,6 @@ async function refreshToken(bling, uid) {
     }
 }
 
-// --- ROTAS PARA BUSCAR DADOS DO FIRESTORE ---
-
 async function getFirestoreData(req, res, collectionName) {
     const { uid } = req.query;
     if (!uid) {
@@ -114,8 +108,6 @@ router.get('/status', async (req, res) => {
         res.status(500).json({ success: false, connected: false, error: 'Erro ao verificar status.' });
     }
 });
-
-// --- LÓGICA DE SINCRONIZAÇÃO COM O BLING ---
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -233,7 +225,6 @@ function mapBlingToFirestore(item, dataType, lookups = {}) {
     };
 }
 
-// ATUALIZADO: Função para atualizar o status de sincronização com merge
 async function updateSyncStatus(uid, payload) {
     if (!uid) return;
     try {
@@ -269,7 +260,6 @@ async function saveItemsInBatches(uid, items, collectionName, dataType, lookups)
     console.log(`[Sync Save] ${batches.length} lotes para ${collectionName} salvos (${items.length} itens).`);
 }
 
-// ATUALIZADO: Função de sincronização com mensagem de continuação
 async function syncDataType(uid, accessToken, dataType, apiPath, collectionName, lookups = {}) {
     const nomeAmigavel = dataType.replace('-', ' ');
     console.log(`[Sync] Iniciando sincronização de ${nomeAmigavel} para UID: ${uid}`);
