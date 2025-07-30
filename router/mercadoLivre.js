@@ -70,27 +70,54 @@ async function getValidTokenML(uid, contaId) {
 router.get('/auth', (req, res) => {
     const { uid } = req.query;
     if (!uid) return res.status(400).send('UID do usuário é obrigatório.');
+
+    // *** MUDANÇA APLICADA ***
+    // Capturamos a URL de origem da requisição (o "Referer") para saber para onde
+    // redirecionar o usuário após a autenticação.
+    const finalRedirectUrl = req.headers.referer || 'http://localhost:8080/contas'; // Use um fallback apropriado para seu ambiente de dev
+
+    // Criamos um objeto de 'state' que contém tanto o UID quanto a URL de redirecionamento.
+    const state = {
+        uid: uid,
+        finalRedirectUrl: finalRedirectUrl
+    };
+    
+    // Codificamos o objeto de estado em Base64 para passá-lo de forma segura.
+    const encodedState = Buffer.from(JSON.stringify(state)).toString('base64');
+
     const backendUrl = NGROK.url || 'https://econtazoom-backend.onrender.com';
     const redirectUri = `${backendUrl}/ml/callback`;
     
-    // *** CORREÇÃO APLICADA AQUI ***
-    // Alterado o URL de 'auth.mercadolibre.com.br' para 'auth.mercadolibre.com'
-    // para usar o domínio global e evitar possíveis problemas de DNS.
     const authUrl = new URL('https://auth.mercadolibre.com/authorization');
 
     authUrl.searchParams.append('response_type', 'code');
     authUrl.searchParams.append('client_id', CLIENT_ID);
     authUrl.searchParams.append('redirect_uri', redirectUri);
-    authUrl.searchParams.append('state', uid);
+    authUrl.searchParams.append('state', encodedState); // Passamos o estado codificado
     res.redirect(authUrl.toString());
 });
 
 router.get('/callback', async (req, res) => {
-    const { code, state: uid } = req.query;
-    if (!code || !uid) {
-        return res.status(400).send('Parâmetros de callback ausentes (código ou estado).');
-    }
+    const { code, state: encodedState } = req.query;
+    
+    let uid;
+    let finalRedirectUrl;
+
     try {
+        if (!code || !encodedState) {
+            return res.status(400).send('Parâmetros de callback ausentes (código ou estado).');
+        }
+
+        // *** MUDANÇA APLICADA ***
+        // Decodificamos o 'state' para recuperar o UID e a URL de redirecionamento final.
+        const decodedState = JSON.parse(Buffer.from(encodedState, 'base64').toString('utf8'));
+        uid = decodedState.uid;
+        finalRedirectUrl = decodedState.finalRedirectUrl;
+
+        if (!uid) {
+            throw new Error('UID não encontrado no estado de autenticação.');
+        }
+
         const backendUrl = NGROK.url || 'https://econtazoom-backend.onrender.com';
         const redirectUri = `${backendUrl}/ml/callback`;
         const tokenResponse = await fetch('https://api.mercadolibre.com/oauth/token', {
@@ -129,10 +156,24 @@ router.get('/callback', async (req, res) => {
             lastTokenRefresh: new Date().toISOString(),
             lastSyncTimestamp: null,
         }, { merge: true });
-        res.send('<script>window.close();</script><h1>Autenticação concluída! Pode fechar esta janela.</h1>');
+
+        // *** MUDANÇA APLICADA ***
+        // Em vez de mostrar uma mensagem e fechar a janela, redirecionamos o usuário
+        // de volta para a página de onde ele veio.
+        res.redirect(finalRedirectUrl);
+
     } catch (error) {
         console.error('Erro no callback do Mercado Livre:', error);
-        res.status(500).send(`Erro durante a autenticação: ${error.message}`);
+        
+        // Em caso de erro, também redirecionamos de volta, mas com parâmetros de erro na URL.
+        if (finalRedirectUrl) {
+            const errorRedirectUrl = new URL(finalRedirectUrl);
+            errorRedirectUrl.searchParams.append('auth_error', 'ml_failed');
+            errorRedirectUrl.searchParams.append('auth_message', error.message);
+            res.redirect(errorRedirectUrl.toString());
+        } else {
+            res.status(500).send(`Erro durante a autenticação: ${error.message}. Não foi possível redirecionar de volta.`);
+        }
     }
 });
 
@@ -484,8 +525,6 @@ async function processSingleOrderDetail(uid, accountId, token, orderDetails) {
             status: orderDetails.status,
             dataHora: orderDetails.date_created, // Mantido para referência
             date_created: orderDetails.date_created,
-            // *** CORREÇÃO ADICIONADA AQUI ***
-            // O campo 'date_closed' é essencial para os filtros de data no frontend.
             date_closed: orderDetails.date_closed,
             cliente: cliente,
             nomeProdutoVendido: orderItems[0]?.item?.title || '-',
