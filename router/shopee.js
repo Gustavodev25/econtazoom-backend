@@ -160,11 +160,9 @@ router.get('/check-updates', async (req, res) => {
             const shopId = conta.id; 
             const shopName = conta.shop_name;
 
-            const vendasRef = db.collection('users').doc(uid).collection('shopeeVendas').where('shop_id', '==', shopId);
-            const vendasSnapshot = await vendasRef.limit(1).get();
-            const hasSavedSales = !vendasSnapshot.empty;
-
-            if (!hasSavedSales) {
+            // Lógica para determinar se é a primeira sincronização
+            const isFirstSync = !conta.lastSyncTimestamp;
+            if (isFirstSync) {
                 return { id: shopId, nome: shopName, status: 'unsynced', newOrdersCount: 0 };
             }
 
@@ -197,10 +195,15 @@ router.post('/sync-single-shop', (req, res) => {
     });
 });
 
-const updateSyncStatus = async (uid, message, progress = null, isError = false, shopName = '') => {
+// ALTERADO: Adicionado parâmetro 'salesProcessed' para um feedback mais claro
+const updateSyncStatus = async (uid, message, progress = null, isError = false, shopName = '', salesProcessed = null) => {
     const statusRef = db.collection('users').doc(uid).collection('shopee').doc('sync_status');
     const statusUpdate = { message, lastUpdate: new Date().toISOString(), isError, shopName };
     if (progress !== null) statusUpdate.progress = progress;
+    // Adiciona a contagem de vendas processadas ao status, se fornecido
+    if (salesProcessed !== null && !isNaN(salesProcessed)) {
+        statusUpdate.salesProcessed = salesProcessed;
+    }
     await statusRef.set(statusUpdate, { merge: true });
 };
 
@@ -227,22 +230,20 @@ async function runFullShopeeSync(uid, singleShopId = null) {
         const shopName = conta.shop_name || `Loja ${shopId}`;
         const shopRef = db.collection('users').doc(uid).collection('shopee').doc(shopId);
         
-        const vendasRef = db.collection('users').doc(uid).collection('shopeeVendas').where('shop_id', '==', shopId);
-        const vendasSnapshot = await vendasRef.limit(1).get();
-        const isFirstSync = vendasSnapshot.empty;
+        // ALTERADO: Lógica mais robusta para determinar a primeira sincronização
+        const lastSyncTimestamp = conta.lastSyncTimestamp || null;
 
         try {
             const syncExecutionTime = Math.floor(Date.now() / 1000);
-
             await updateSyncStatus(uid, `Iniciando...`, 0, false, shopName);
             
-            const orderSnList = await getAllOrderSnForShop(uid, shopId, isFirstSync ? null : conta.lastSyncTimestamp, syncExecutionTime);
+            const orderSnList = await getAllOrderSnForShop(uid, shopId, lastSyncTimestamp, syncExecutionTime);
             
+            // CORREÇÃO: Atualiza o timestamp mesmo que não haja novas vendas. Essencial para a primeira sincronização.
             if (orderSnList.length === 0) {
-                 if (!isFirstSync) {
-                    await shopRef.update({ lastSyncTimestamp: syncExecutionTime });
-                 }
-                 await updateSyncStatus(uid, `Nenhum pedido novo encontrado.`, 100, false, shopName);
+                 await shopRef.update({ lastSyncTimestamp: syncExecutionTime });
+                 // Informa que 0 vendas foram processadas
+                 await updateSyncStatus(uid, `Nenhuma venda nova ou atualização encontrada.`, 100, false, shopName, 0);
                  await delay(1500);
                  continue; 
             }
@@ -252,24 +253,28 @@ async function runFullShopeeSync(uid, singleShopId = null) {
                 updateSyncStatus(uid, `Processando detalhes...`, 20 + Math.floor(progress * 70), false, shopName);
             });
             
-            await updateSyncStatus(uid, `Salvando ${allVendasComDetalhes.length} vendas...`, 95, false, shopName);
+            const salesAddedCount = allVendasComDetalhes.length;
+            await updateSyncStatus(uid, `Salvando ${salesAddedCount} vendas...`, 95, false, shopName);
             
-            const firestoreBatchChunks = chunkArray(allVendasComDetalhes, 400); 
-            for (const batchChunk of firestoreBatchChunks) {
-                const batch = db.batch();
-                for (const venda of batchChunk) {
-                    if (venda && venda.order_sn) {
-                        const vendaDocRef = db.collection('users').doc(uid).collection('shopeeVendas').doc(venda.order_sn);
-                        const finalVendaData = cleanObject({ ...venda, nomeConta: shopName });
-                        batch.set(vendaDocRef, finalVendaData, { merge: true });
+            if (salesAddedCount > 0) {
+                const firestoreBatchChunks = chunkArray(allVendasComDetalhes, 400); 
+                for (const batchChunk of firestoreBatchChunks) {
+                    const batch = db.batch();
+                    for (const venda of batchChunk) {
+                        if (venda && venda.order_sn) {
+                            const vendaDocRef = db.collection('users').doc(uid).collection('shopeeVendas').doc(venda.order_sn);
+                            const finalVendaData = cleanObject({ ...venda, nomeConta: shopName });
+                            batch.set(vendaDocRef, finalVendaData, { merge: true });
+                        }
                     }
+                    await batch.commit();
                 }
-                await batch.commit();
             }
 
             await shopRef.update({ lastSyncTimestamp: syncExecutionTime });
 
-            await updateSyncStatus(uid, `Sincronização concluída!`, 100, false, shopName);
+            // ALTERADO: Adiciona a contagem de vendas ao status de sucesso
+            await updateSyncStatus(uid, `Sincronização concluída!`, 100, false, shopName, salesAddedCount);
             await delay(1500);
         } catch (error) {
             console.error(`[Shopee Sync BG] Erro ao sincronizar ${shopName}:`, error);
@@ -281,24 +286,31 @@ async function runFullShopeeSync(uid, singleShopId = null) {
     await updateSyncStatus(uid, `Processo finalizado.`, 100, false, 'Sistema');
 }
 
+// ALTERADO: Lógica de busca de pedidos refatorada para maior clareza
 async function getAllOrderSnForShop(uid, shopId, lastSyncTimestamp, syncExecutionTime) {
     const allOrderSn = new Set();
     const path = '/api/v2/order/get_order_list';
     const isInitialSync = !lastSyncTimestamp;
-    const time_range_field = isInitialSync ? 'create_time' : 'update_time';
     
-    if (!isInitialSync) {
-        const time_from = lastSyncTimestamp - (60 * 10);
-        await fetchOrderListChunk(uid, shopId, path, time_from, syncExecutionTime, time_range_field, allOrderSn);
-    } else {
+    if (isInitialSync) {
+        // Primeira sincronização: busca os últimos 90 dias de pedidos CRIADOS
+        const time_range_field = 'create_time';
         const totalLookbackDays = 90;
         const initialSyncStartTime = syncExecutionTime; 
         for (let i = 0; i < totalLookbackDays / 15; i++) {
             const time_to = initialSyncStartTime - (i * 15 * 24 * 60 * 60);
             const time_from = time_to - (15 * 24 * 60 * 60);
+            if (time_from < 0) break;
             await fetchOrderListChunk(uid, shopId, path, time_from, time_to, time_range_field, allOrderSn);
         }
+    } else {
+        // Sincronizações seguintes: busca pedidos ATUALIZADOS desde a última vez
+        const time_range_field = 'update_time';
+        // Busca 10 minutos extras para evitar perder pedidos por diferenças de relógio
+        const time_from = lastSyncTimestamp - (60 * 10);
+        await fetchOrderListChunk(uid, shopId, path, time_from, syncExecutionTime, time_range_field, allOrderSn);
     }
+    
     return Array.from(allOrderSn);
 }
 
@@ -403,8 +415,6 @@ async function getDetailsForChunk(uid, shopId, token, orderSnChunk) {
                     tracking_number: order.package_list?.[0]?.tracking_number || 'N/A',
                     txPlataforma: txPlataforma,
                     custoFrete: custoFrete,
-
-                    // *** CAMPOS PADRONIZADOS ADICIONADOS ***
                     tipoAnuncio: 'Padrão',
                     tipoEntrega: order.shipping_carrier || 'Não informado',
                 };

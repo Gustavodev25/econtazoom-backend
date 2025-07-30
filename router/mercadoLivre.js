@@ -1,6 +1,5 @@
 const express = require('express');
 const fetch = (...args) => import('node-fetch').then(m => m.default(...args));
-const crypto = require('crypto');
 const router = express.Router();
 const { db } = require('../firebase'); 
 const { FieldPath } = require('firebase-admin/firestore');
@@ -197,22 +196,19 @@ router.get('/vendas-paginadas', async (req, res) => {
   } catch (error) { res.status(500).json({ error: `Erro no servidor: ${error.message}` }); }
 });
 
-const updateSyncStatus = async (uid, message, progress = null, isError = false, accountName = '') => {
+// ALTERADO: Adicionado parâmetro 'salesProcessed' para um feedback mais claro
+const updateSyncStatus = async (uid, message, progress = null, isError = false, accountName = '', salesProcessed = null) => {
     const statusRef = db.collection('users').doc(uid).collection('mercadoLivre').doc('sync_status');
     const statusUpdate = { message, lastUpdate: new Date().toISOString(), isError, accountName };
     if (progress !== null) statusUpdate.progress = progress;
+    // Adiciona a contagem de vendas processadas ao status, se fornecido
+    if (salesProcessed !== null && !isNaN(salesProcessed)) {
+        statusUpdate.salesProcessed = salesProcessed;
+    }
     await statusRef.set(statusUpdate, { merge: true });
 };
 
-async function getNewlyCreatedOrderIds(uid, accountId, lastSyncTimestamp) {
-    if (!lastSyncTimestamp) return [];
-    const token = await getValidTokenML(uid, accountId);
-    const dateFrom = new Date(lastSyncTimestamp * 1000);
-    dateFrom.setMinutes(dateFrom.getMinutes() - 20); 
-    const dateTo = new Date();
-    return await fetchOrderIdsForDateRange(token, accountId, dateFrom, dateTo, 'last_updated');
-}
-
+// ALTERADO: Lógica de verificação de atualizações simplificada
 router.get('/check-updates', async (req, res) => {
     const { uid } = req.query;
     if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
@@ -222,50 +218,30 @@ router.get('/check-updates', async (req, res) => {
 
         const statusPromises = contasSnap.docs.map(async (doc) => {
             const conta = { id: doc.id, ...doc.data() };
-            const accountId = parseInt(conta.id, 10);
+            const accountId = conta.id;
             const accountName = conta.nickname;
 
+            // Se não houver 'lastSyncTimestamp', a conta nunca foi sincronizada.
+            if (!conta.lastSyncTimestamp) {
+                return { id: accountId, nome: accountName, status: 'unsynced', newOrdersCount: 0 };
+            }
+
             try {
-                const vendasCheckRef = db.collection('users').doc(uid).collection('mlVendas').where('seller.id', '==', accountId).limit(1);
-                const vendasCheckSnap = await vendasCheckRef.get();
-                
-                if (vendasCheckSnap.empty) {
-                    return { id: conta.id, nome: accountName, status: 'unsynced', newOrdersCount: 0 };
+                // Busca apenas por pedidos atualizados desde a última sincronização.
+                const updatedOrderIds = await getUpdatedOrderIds(uid, accountId, conta.lastSyncTimestamp);
+                if (updatedOrderIds.length > 0) {
+                    return { id: accountId, nome: accountName, status: 'needs_update', newOrdersCount: updatedOrderIds.length };
+                } else {
+                    return { id: accountId, nome: accountName, status: 'synced', newOrdersCount: 0 };
                 }
-
-                const newlyCreatedIds = await getNewlyCreatedOrderIds(uid, conta.id, conta.lastSyncTimestamp);
-
-                if (newlyCreatedIds.length === 0) {
-                    return { id: conta.id, nome: accountName, status: 'synced', newOrdersCount: 0 };
-                }
-
-                const vendasRef = db.collection('users').doc(uid).collection('mlVendas');
-                const idChunks = chunkArray(newlyCreatedIds.map(id => id.toString()), 30);
-                const existingIds = new Set();
-
-                for (const chunk of idChunks) {
-                    if (chunk.length === 0) continue;
-                    const querySnapshot = await vendasRef.where(FieldPath.documentId(), 'in', chunk).get();
-                    querySnapshot.forEach(doc => existingIds.add(doc.id));
-                }
-
-                const newOrdersCount = newlyCreatedIds.length - existingIds.size;
-                
-                return { 
-                    id: conta.id, 
-                    nome: accountName, 
-                    status: newOrdersCount > 0 ? 'needs_update' : 'synced', 
-                    newOrdersCount 
-                };
-
             } catch (error) {
                 console.error(`Erro ao verificar conta ${accountName}:`, error);
-                return { id: conta.id, nome: accountName, status: 'error', newOrdersCount: 0, error: error.message };
+                return { id: accountId, nome: accountName, status: 'error', newOrdersCount: 0, error: error.message };
             }
         });
         res.json(await Promise.all(statusPromises));
     } catch (error) { 
-        res.status(500).json({ error: 'Erro ao verificar contas ML', detalhe: error.message, status: 'error' }); 
+        res.status(500).json({ error: 'Erro ao verificar contas ML', detalhe: error.message }); 
     }
 });
 
@@ -280,22 +256,20 @@ router.post('/sync-single-shop', (req, res) => {
     });
 });
 
+// ALTERADO: Lógica de sincronização principal refatorada para maior clareza e robustez
 async function runFullMercadoLivreSync(uid, singleAccountId) {
     const contaRef = db.collection('users').doc(uid).collection('mercadoLivre').doc(singleAccountId);
-    let conta, accountName;
+    let accountName = `Conta ${singleAccountId}`;
 
     try {
         const contaSnap = await contaRef.get();
         if (!contaSnap.exists || contaSnap.data().status !== 'ativo') {
             throw new Error(`Conta ${singleAccountId} não encontrada ou está inativa.`);
         }
-        conta = { id: contaSnap.id, ...contaSnap.data() };
-        accountName = conta.nickname || `Conta ${conta.id}`;
+        const conta = { id: contaSnap.id, ...contaSnap.data() };
+        accountName = conta.nickname || accountName;
         
-        const vendasCheckRef = db.collection('users').doc(uid).collection('mlVendas').where('seller.id', '==', parseInt(conta.id, 10)).limit(1);
-        const vendasCheckSnap = await vendasCheckRef.get();
-        const isFirstSync = vendasCheckSnap.empty;
-
+        const isFirstSync = !conta.lastSyncTimestamp;
         const syncStartTime = Math.floor(Date.now() / 1000);
 
         await updateSyncStatus(uid, `Iniciando...`, 0, false, accountName);
@@ -304,56 +278,50 @@ async function runFullMercadoLivreSync(uid, singleAccountId) {
 
         if (orderIdList.length === 0) {
             await contaRef.update({ lastSyncTimestamp: syncStartTime });
-            await updateSyncStatus(uid, `Nenhum pedido novo ou histórico encontrado.`, 100, false, accountName);
+            await updateSyncStatus(uid, `Nenhuma venda nova ou atualização encontrada.`, 100, false, accountName, 0);
             return;
         }
 
         await updateSyncStatus(uid, `Encontrados ${orderIdList.length} IDs de vendas. Buscando detalhes...`, 20, false, accountName);
-        const allVendasComDetalhes = await getOrderDetailsInParallel(uid, conta.id, orderIdList, (progress) => {
+        const allVendasComDetalhes = await getOrderDetailsInParallel(uid, conta.id, orderIdList, (progress, processed, total) => {
             const prog = 20 + Math.floor(progress * 70);
-            updateSyncStatus(uid, `Processando detalhes... (${Math.round(progress * orderIdList.length)} de ${orderIdList.length})`, prog, false, accountName);
+            updateSyncStatus(uid, `Processando detalhes... (${processed} de ${total})`, prog, false, accountName);
         });
         
-        const firestoreBatchChunks = chunkArray(allVendasComDetalhes, 250);
-        let savedCount = 0;
-        let chunkIndex = 0;
-
-        for (const batchChunk of firestoreBatchChunks) {
-            chunkIndex++;
-            const savingProgress = 90 + Math.floor((chunkIndex / firestoreBatchChunks.length) * 9);
-            const message = `Salvando lote ${chunkIndex}/${firestoreBatchChunks.length} (${savedCount + batchChunk.length}/${allVendasComDetalhes.length} vendas)`;
-            await updateSyncStatus(uid, message, savingProgress, false, accountName);
-
-            const batch = db.batch();
-            for (const venda of batchChunk) {
-                if (venda && venda.id) {
-                    const vendaDocRef = db.collection('users').doc(uid).collection('mlVendas').doc(venda.id.toString());
-                    const finalVendaData = { ...venda, nomeConta: accountName };
-                    batch.set(vendaDocRef, finalVendaData, { merge: true });
+        const salesAddedCount = allVendasComDetalhes.length;
+        if (salesAddedCount > 0) {
+            await updateSyncStatus(uid, `Salvando ${salesAddedCount} vendas...`, 95, false, accountName);
+            const firestoreBatchChunks = chunkArray(allVendasComDetalhes, 400);
+            for (const batchChunk of firestoreBatchChunks) {
+                const batch = db.batch();
+                for (const venda of batchChunk) {
+                    if (venda && venda.id) {
+                        const vendaDocRef = db.collection('users').doc(uid).collection('mlVendas').doc(venda.id.toString());
+                        const finalVendaData = { ...venda, nomeConta: accountName };
+                        batch.set(vendaDocRef, cleanObject(finalVendaData), { merge: true });
+                    }
                 }
+                await batch.commit();
             }
-            await batch.commit();
-            savedCount += batchChunk.length;
         }
 
         await contaRef.update({ lastSyncTimestamp: syncStartTime });
-        await updateSyncStatus(uid, `Sincronização concluída!`, 100, false, accountName);
+        await updateSyncStatus(uid, `Sincronização concluída!`, 100, false, accountName, salesAddedCount);
 
     } catch (error) {
-        console.error(`[ML Sync BG] Erro ao sincronizar ${accountName || singleAccountId}:`, error);
-        const finalAccountName = accountName || `Conta ${singleAccountId}`;
-        await updateSyncStatus(uid, `Erro: ${error.message}`, 100, true, finalAccountName);
+        console.error(`[ML Sync BG] Erro ao sincronizar ${accountName}:`, error);
+        await updateSyncStatus(uid, `Erro: ${error.message}`, 100, true, accountName);
     }
 }
 
-async function fetchOrderIdsForDateRange(token, sellerId, dateFrom, dateTo, filterField) {
+async function fetchOrderIdsForDateRange(token, sellerId, dateFrom, dateTo) {
     const ids = new Set();
     let offset = 0;
     const limit = 50;
+    const dateQuery = `&order.last_updated_date=${dateFrom.toISOString().slice(0, -5)}Z,${dateTo.toISOString().slice(0, -5)}Z`;
+    
     while (true) {
-        const dateQuery = `&order.${filterField}.from=${dateFrom.toISOString()}&order.${filterField}.to=${dateTo.toISOString()}`;
         const url = `https://api.mercadolibre.com/orders/search?seller=${sellerId}&sort=date_desc&offset=${offset}&limit=${limit}${dateQuery}`;
-        
         try {
             const response = await fetch(url, { headers: { Authorization: `Bearer ${token}` }, timeout: AXIOS_TIMEOUT });
             if (!response.ok) {
@@ -365,7 +333,7 @@ async function fetchOrderIdsForDateRange(token, sellerId, dateFrom, dateTo, filt
             if (!data.results || data.results.length === 0) break; 
             data.results.forEach(order => ids.add(order.id));
             offset += limit;
-            if (offset >= 10000) break;
+            if (offset >= data.paging.total || offset >= 10000) break;
             await delay(250);
         } catch (error) {
             console.error(`[ML Fetch Chunk] Falha de rede: ${error.message}`);
@@ -375,20 +343,25 @@ async function fetchOrderIdsForDateRange(token, sellerId, dateFrom, dateTo, filt
     return Array.from(ids);
 }
 
+async function getUpdatedOrderIds(uid, accountId, lastSyncTimestamp) {
+    const token = await getValidTokenML(uid, accountId);
+    const dateFrom = new Date(lastSyncTimestamp * 1000);
+    dateFrom.setMinutes(dateFrom.getMinutes() - 30); // Margem de segurança
+    const dateTo = new Date();
+    return await fetchOrderIdsForDateRange(token, accountId, dateFrom, dateTo);
+}
+
 async function getAllOrderIdsForAccount(uid, accountId, lastSyncTimestamp) {
     const token = await getValidTokenML(uid, accountId);
-    const allOrderIds = new Set();
     const isInitialSync = !lastSyncTimestamp;
 
     if (isInitialSync) {
-        console.log(`[ML Sync] Sincronização Inicial para conta ${accountId}. Buscando todo o histórico via paginação.`);
+        console.log(`[ML Sync] Sincronização Inicial para conta ${accountId}. Buscando todo o histórico.`);
+        const allOrderIds = new Set();
         let offset = 0;
         const limit = 50;
-
         while (true) {
             const url = `https://api.mercadolibre.com/orders/search?seller=${accountId}&sort=date_desc&offset=${offset}&limit=${limit}`;
-            console.log(`[ML Sync] Buscando vendas... offset: ${offset}`);
-            
             try {
                 const response = await fetch(url, { headers: { Authorization: `Bearer ${token}` }, timeout: AXIOS_TIMEOUT });
                 if (!response.ok) {
@@ -396,36 +369,22 @@ async function getAllOrderIdsForAccount(uid, accountId, lastSyncTimestamp) {
                     console.error(`[ML Sync] Erro na API do ML ao buscar histórico: ${errorData.message}`);
                     break; 
                 }
-
                 const data = await response.json();
-                if (!data.results || data.results.length === 0) {
-                    console.log("[ML Sync] Fim do histórico de vendas encontrado.");
-                    break; 
-                }
-
+                if (!data.results || data.results.length === 0) break; 
                 data.results.forEach(order => allOrderIds.add(order.id));
                 offset += limit;
-
-                if (offset >= 10000) {
-                    console.warn(`[ML Sync] Atingido o limite de offset da API (10000). A busca pode não incluir vendas mais antigas que isso.`);
-                    break;
-                }
-
+                if (offset >= data.paging.total || offset >= 10000) break;
                 await delay(300);
             } catch (error) {
                 console.error(`[ML Sync] Falha de rede ao buscar histórico: ${error.message}`);
                 break;
             }
         }
+        return Array.from(allOrderIds);
     } else {
-        console.log(`[ML Sync] Atualização para conta ${accountId}.`);
-        const dateFrom = new Date(lastSyncTimestamp * 1000);
-        dateFrom.setMinutes(dateFrom.getMinutes() - 30);
-        const dateTo = new Date();
-        const updatedOrders = await fetchOrderIdsForDateRange(token, accountId, dateFrom, dateTo, 'last_updated');
-        updatedOrders.forEach(id => allOrderIds.add(id));
+        console.log(`[ML Sync] Buscando atualizações para conta ${accountId}.`);
+        return await getUpdatedOrderIds(uid, accountId, lastSyncTimestamp);
     }
-    return Array.from(allOrderIds);
 }
 
 
@@ -433,40 +392,27 @@ async function getOrderDetailsInParallel(uid, accountId, orderIdList, onProgress
     const token = await getValidTokenML(uid, accountId);
     let allVendasCompletas = [];
     let processedCount = 0;
+    const totalCount = orderIdList.length;
 
     const chunks = chunkArray(orderIdList, 20);
 
     for (const chunk of chunks) {
         const promises = chunk.map(orderId => {
             if (!orderId) return Promise.resolve(null);
-            
             const url = `https://api.mercadolibre.com/orders/${orderId}`;
-            return fetch(url, { 
-                headers: { Authorization: `Bearer ${token}` }, 
-                timeout: AXIOS_TIMEOUT 
-            })
-            .then(res => {
-                if (!res.ok) {
-                    console.warn(`[ML Detail] Falha ao buscar detalhe do pedido ${orderId}. Status: ${res.status}`);
-                    return null;
-                }
-                return res.json();
-            })
-            .catch(err => {
-                console.warn(`[ML Detail] Erro de rede ao buscar pedido ${orderId}: ${err.message}`);
-                return null;
-            });
+            return fetch(url, { headers: { Authorization: `Bearer ${token}` }, timeout: AXIOS_TIMEOUT })
+                .then(res => res.ok ? res.json() : null)
+                .catch(() => null);
         });
 
         const results = await Promise.all(promises);
-        
         const validDetails = results.filter(r => r !== null);
         
-        const processedDetails = await Promise.all(validDetails.map(order => processSingleOrderDetail(uid, accountId, token, order)));
+        const processedDetails = await Promise.all(validDetails.map(order => processSingleOrderDetail(token, order)));
         allVendasCompletas.push(...processedDetails.filter(Boolean));
         
         processedCount += chunk.length;
-        if (onProgress) onProgress(processedCount / orderIdList.length);
+        if (onProgress) onProgress(processedCount / totalCount, processedCount, totalCount);
 
         await delay(333);
     }
@@ -474,18 +420,13 @@ async function getOrderDetailsInParallel(uid, accountId, orderIdList, onProgress
 }
 
 
-async function processSingleOrderDetail(uid, accountId, token, orderDetails) {
+async function processSingleOrderDetail(token, orderDetails) {
     try {
-        if (!orderDetails || !orderDetails.id) {
-            console.warn('[ML Process] Recebido um item inválido no processamento de detalhes.');
-            return null;
-        }
+        if (!orderDetails || !orderDetails.id) return null;
 
         let shipmentDetails = {};
         if (orderDetails.shipping?.id) {
-            const shipmentRes = await fetch(`https://api.mercadolibre.com/shipments/${orderDetails.shipping.id}`, { 
-                headers: { Authorization: `Bearer ${token}` } 
-            });
+            const shipmentRes = await fetch(`https://api.mercadolibre.com/shipments/${orderDetails.shipping.id}`, { headers: { Authorization: `Bearer ${token}` } });
             if (shipmentRes.ok) shipmentDetails = await shipmentRes.json();
         }
 
@@ -494,7 +435,7 @@ async function processSingleOrderDetail(uid, accountId, token, orderDetails) {
         const saleFee = orderItems.reduce((acc, item) => acc + (item.sale_fee || 0), 0);
         const cliente = orderDetails.buyer?.nickname || `${orderDetails.buyer?.first_name || ''} ${orderDetails.buyer?.last_name || ''}`.trim() || 'Desconhecido';
 
-        const vendaParaSalvar = {
+        return {
             id: orderDetails.id?.toString(),
             idVendaMarketplace: orderDetails.id?.toString(),
             canalVenda: 'Mercado Livre',
@@ -507,101 +448,48 @@ async function processSingleOrderDetail(uid, accountId, token, orderDetails) {
             valorTotalVenda: Number(orderDetails.total_amount || 0),
             txPlataforma: saleFee,
             custoFrete: shippingCost,
-            
-            // *** CAMPOS PADRONIZADOS ADICIONADOS ***
             tipoAnuncio: orderItems[0]?.listing_type_id || 'Não informado',
             tipoEntrega: shipmentDetails.shipping_option?.name || shipmentDetails.logistic_type || 'Não informado',
-
             seller: { id: orderDetails.seller?.id, nickname: orderDetails.seller?.nickname },
             order_items: orderItems.map(item => ({
-                item: {
-                    id: item.item?.id,
-                    title: item.item?.title,
-                    seller_sku: item.item?.seller_sku,
-                },
-                quantity: item.quantity,
-                unit_price: item.unit_price,
-                sale_fee: item.sale_fee,
-                // *** DADO QUE FALTAVA ADICIONADO ***
-                listing_type_id: item.listing_type_id,
+                item: { id: item.item?.id, title: item.item?.title, seller_sku: item.item?.seller_sku },
+                quantity: item.quantity, unit_price: item.unit_price, sale_fee: item.sale_fee, listing_type_id: item.listing_type_id,
             })),
             payments: (orderDetails.payments || []).map(p => ({
-                id: p.id,
-                status: p.status,
-                transaction_amount: p.transaction_amount,
-                payment_method_id: p.payment_method_id,
-                payment_type: p.payment_type,
+                id: p.id, status: p.status, transaction_amount: p.transaction_amount, payment_method_id: p.payment_method_id, payment_type: p.payment_type,
             })),
-            buyer: {
-                id: orderDetails.buyer?.id,
-                nickname: orderDetails.buyer?.nickname,
-                first_name: orderDetails.buyer?.first_name,
-                last_name: orderDetails.buyer?.last_name,
-            },
-            shipping: {
-                id: orderDetails.shipping?.id,
-                status: orderDetails.shipping?.status,
-                logistic_type: orderDetails.shipping?.logistic_type,
-            },
+            buyer: { id: orderDetails.buyer?.id, nickname: orderDetails.buyer?.nickname, first_name: orderDetails.buyer?.first_name, last_name: orderDetails.buyer?.last_name },
+            shipping: { id: orderDetails.shipping?.id, status: orderDetails.shipping?.status, logistic_type: orderDetails.shipping?.logistic_type },
             shipping_details: {
-                id: shipmentDetails.id,
-                status: shipmentDetails.status,
-                logistic_type: shipmentDetails.logistic_type,
-                shipping_option: shipmentDetails.shipping_option,
+                id: shipmentDetails.id, status: shipmentDetails.status, logistic_type: shipmentDetails.logistic_type, shipping_option: shipmentDetails.shipping_option,
                 tracking_number: shipmentDetails.tracking_number,
                 receiver_address: {
-                    address_line: shipmentDetails.receiver_address?.address_line,
-                    city: shipmentDetails.receiver_address?.city?.name,
-                    state: shipmentDetails.receiver_address?.state?.name,
-                    zip_code: shipmentDetails.receiver_address?.zip_code,
+                    address_line: shipmentDetails.receiver_address?.address_line, city: shipmentDetails.receiver_address?.city?.name,
+                    state: shipmentDetails.receiver_address?.state?.name, zip_code: shipmentDetails.receiver_address?.zip_code,
                 }
             }
         };
-
-        return cleanObject(vendaParaSalvar);
-
     } catch (error) {
         console.warn(`[ML Process] Erro ao processar venda ${orderDetails.id}: ${error.message}`);
         return null;
     }
 }
 
-
 function calcularFreteAdjust(orderDetails, shippingDetails) {
     const logisticType = shippingDetails?.logistic_type;
     const shippingOption = shippingDetails?.shipping_option;
     const unitPrice = Number(orderDetails.order_items?.[0]?.unit_price || 0);
-
     const listCost = Number(shippingOption?.list_cost || 0);
     const buyerCost = Number(shippingOption?.cost || 0);
     const baseCost = Number(shippingOption?.base_cost || 0);
-
-    let custoBruto = 0;
     let finalCost = 0;
 
     switch (logisticType) {
-        case 'self_service':
-            custoBruto = (unitPrice < 79) ? baseCost : (baseCost - listCost);
-            finalCost = -custoBruto; 
-            break;
-
-        case 'drop_off':
-        case 'xd_drop_off':
-            custoBruto = listCost - buyerCost;
-            finalCost = Math.max(0, custoBruto);
-            break;
-
-        case 'fulfillment':
-        case 'cross_docking': 
-            custoBruto = listCost;
-            finalCost = Math.max(0, custoBruto);
-            break;
-
-        default:
-            finalCost = 0;
-            break;
+        case 'self_service': finalCost = (unitPrice < 79) ? baseCost : (baseCost - listCost); break;
+        case 'drop_off': case 'xd_drop_off': finalCost = Math.max(0, listCost - buyerCost); break;
+        case 'fulfillment': case 'cross_docking': finalCost = Math.max(0, listCost); break;
+        default: finalCost = 0; break;
     }
-
     return parseFloat(finalCost.toFixed(2));
 }
 

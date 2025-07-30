@@ -1,24 +1,25 @@
-// index.js
+// index.js (Corrigido e Otimizado)
 
 const express = require('express');
 const cors = require('cors');
-const bodyParser = require('body-parser');
 const ngrok = require('ngrok');
-const { NGROK } = require('./router/sharedState'); // ATUALIZADO: Importa do novo arquivo centralizado
+const { db } = require('./firebase');
+
+// --- Importação das Rotas ---
+// É uma boa prática manter as rotas em uma pasta dedicada.
+const { NGROK } = require('./router/sharedState'); 
 const mercadoLivreRouter = require('./router/mercadoLivre');
 const blingRouter = require('./router/bling');
 const shopeeRouter = require('./router/shopee'); 
-const { db } = require('./firebase');
 
+// --- Constantes e Configuração Inicial ---
 const app = express();
-
-app.use(cors());
-app.use(bodyParser.json({ limit: '20mb' }));
-app.use(bodyParser.urlencoded({ extended: true, limit: '20mb' }));
-
 const PORT = process.env.PORT || 3001;
 const NGROK_AUTHTOKEN = process.env.NGROK_AUTHTOKEN || '1oqB3iP42FXti1LBFru5iA0KMoL_3L1XTqcUwsjXbccgXYxdz';
 
+// --- Configuração dos Middlewares (A ORDEM É IMPORTANTE) ---
+
+// 1. Configuração do CORS (Cross-Origin Resource Sharing)
 const allowedOrigins = [
   'http://localhost:8080',
   'http://localhost:3000',
@@ -26,90 +27,92 @@ const allowedOrigins = [
   'https://econtazoom-backend.onrender.com',
   'https://econtazoom.com.br'
 ];
-app.use(
-  cors({
-    origin: function (origin, callback) {
-      if (!origin) return callback(null, true);
-      if (allowedOrigins.includes(origin) || (origin && origin.includes('ngrok'))) return callback(null, true);
-      return callback(new Error('Not allowed by CORS'));
-    },
-    methods: ['GET', 'POST'],
-    allowedHeaders: ['Content-Type']
-  })
-);
 
-app.use(express.json());
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Permite requisições sem 'origin' (ex: Postman, apps mobile) e da lista de permitidos.
+    if (!origin || allowedOrigins.includes(origin) || origin.includes('ngrok')) {
+      callback(null, true);
+    } else {
+      callback(new Error('Origem não permitida pelo CORS'));
+    }
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], // Habilita os métodos que sua API usa
+  allowedHeaders: ['Content-Type', 'Authorization'] // Habilita cabeçalhos comuns
+};
+
+app.use(cors(corsOptions));
+
+// 2. Middlewares para processar o corpo das requisições (Body Parsers)
+// Substituí o 'body-parser' obsoleto pelas funções nativas do Express.
+// Isso DEVE vir antes do registro das rotas.
+app.use(express.json({ limit: '20mb' })); // Para processar JSON
+app.use(express.urlencoded({ extended: true, limit: '20mb' })); // Para processar dados de formulários
+
+// 3. Middleware de Log (Opcional, mas útil para depuração)
+// Colocado aqui para registrar todas as requisições que chegam.
+app.use((req, res, next) => {
+  console.log(`[Express] Recebida: ${req.method} ${req.originalUrl}`);
+  next();
+});
+
+// --- Registro das Rotas da Aplicação ---
 app.use('/ml', mercadoLivreRouter);
 app.use('/bling', blingRouter);
 app.use('/shopee', shopeeRouter);
 
-app.use((req, res, next) => {
-  console.log(`[Express] ${req.method} ${req.url} - Query:`, req.query);
-  next();
+// --- Rotas Utilitárias ---
+app.get('/', (req, res) => {
+  res.send('Backend e-Conta Zoom está rodando!');
 });
 
 // Rota para o frontend descobrir a URL pública do backend (ngrok)
 app.get('/api/ngrok-url', (req, res) => {
-  const ngrokUrl = app.locals.ngrokUrl || `http://localhost:${PORT}`;
-  res.json({ url: ngrokUrl });
+  res.json({ url: NGROK.url || `http://localhost:${PORT}` });
 });
 
-app.get('/', (req, res) => {
-  res.send('Backend Express rodando!');
-});
-
-db.collection('test')
-  .limit(1)
-  .get()
-  .then(() => {
-    console.log('Firestore autenticado com sucesso!');
-  })
-  .catch(err => {
-    console.error('Erro ao autenticar no Firestore:', err);
-  });
-
-let ngrokUrl = null;
-
+// --- Função de Inicialização do Servidor ---
 async function startServer() {
   try {
-    const server = app.listen(PORT, () => {});
+    // Validação da conexão com o Firestore na inicialização
+    await db.collection('test').limit(1).get();
+    console.log('Firestore autenticado com sucesso!');
 
+    // Inicia o servidor Express
+    const server = app.listen(PORT, () => {
+      console.log(`Servidor rodando na porta ${PORT}`);
+    });
+
+    // Configuração do Ngrok (apenas em ambiente de desenvolvimento)
     if (process.env.NODE_ENV !== 'production' && !process.env.DISABLE_NGROK) {
       await ngrok.authtoken(NGROK_AUTHTOKEN);
-      ngrokUrl = await ngrok.connect({
-        addr: PORT,
-        authtoken: NGROK_AUTHTOKEN,
-        proto: 'http'
-      });
-      if (ngrokUrl.endsWith('/')) ngrokUrl = ngrokUrl.slice(0, -1);
-      
-      app.locals.ngrokUrl = ngrokUrl;
-      NGROK.url = ngrokUrl; // ATUALIZADO: Modifica o objeto compartilhado
-      
-      console.log('Servidor rodando!');
-      console.log('Acesse via ngrok:', ngrokUrl);
+      const url = await ngrok.connect({ addr: PORT, proto: 'http' });
+      NGROK.url = url.endsWith('/') ? url.slice(0, -1) : url;
+      console.log(`Servidor acessível publicamente via Ngrok: ${NGROK.url}`);
     } else {
-      ngrokUrl = null;
-      app.locals.ngrokUrl = null;
-      NGROK.url = null;
-      console.log('Servidor rodando!');
-      console.log(`Acesse localmente em http://localhost:${PORT}`);
+      console.log(`Acesse localmente em: http://localhost:${PORT}`);
     }
 
-    server.on('error', err => {
-      console.error('Erro no servidor:', err);
+    server.on('error', (err) => {
+      console.error('Erro fatal no servidor:', err);
       process.exit(1);
     });
+
   } catch (err) {
-    console.error('Erro ao iniciar o servidor/ngrok:', err);
+    console.error('Falha ao iniciar o servidor:', err.message);
     process.exit(1);
   }
 }
 
+// --- Tratamento de Encerramento do Processo ---
 process.on('SIGTERM', async () => {
-  console.log('Recebido SIGTERM. Desligando...');
-  if (ngrokUrl) await ngrok.disconnect();
+  console.log('Recebido sinal SIGTERM. Desligando o servidor e o Ngrok...');
+  if (NGROK.url) {
+    await ngrok.disconnect();
+    console.log('Ngrok desconectado.');
+  }
   process.exit(0);
 });
 
+// Inicia a aplicação
 startServer();
