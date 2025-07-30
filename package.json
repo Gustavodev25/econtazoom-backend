@@ -6,7 +6,9 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "axios": "^1.10.0",
+    "axios": "^1.11.0",
+    "axios-retry": "^4.5.0",
+    "body-parser": "^2.2.0",
     "cors": "^2.8.5",
     "crypto": "^1.0.1",
     "express": "^4.21.2",
@@ -15,6 +17,8 @@
     "ngrok": "^5.0.0-beta.2",
     "node-cron": "^4.2.0",
     "node-fetch": "^3.3.2",
-    "vue-select": "^3.20.4"
+    "uuid": "^11.1.0",
+    "vue-select": "^3.20.4",
+    "winston": "^3.17.0"
   }
 }

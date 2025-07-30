@@ -288,7 +288,7 @@ async function getAllOrderSnForShop(uid, shopId, lastSyncTimestamp, syncExecutio
     const time_range_field = isInitialSync ? 'create_time' : 'update_time';
     
     if (!isInitialSync) {
-        const time_from = lastSyncTimestamp - (60 * 10); // 10 min de sobreposição para segurança
+        const time_from = lastSyncTimestamp - (60 * 10);
         await fetchOrderListChunk(uid, shopId, path, time_from, syncExecutionTime, time_range_field, allOrderSn);
     } else {
         const totalLookbackDays = 90;
@@ -373,12 +373,10 @@ async function getDetailsForChunk(uid, shopId, token, orderSnChunk) {
                 const escrowResponse = await axios.get(`${SHOPEE_BASE_URL}${escrowPath}`, { params: { partner_id: parseInt(CLIENT_ID), shop_id: parseInt(shopId), order_sn: order.order_sn, sign: escrowSign, timestamp: escrowTimestamp, access_token: token }, timeout: AXIOS_TIMEOUT });
                 
                 const escrow_detail = (!escrowResponse.data.error && escrowResponse.data.response) ? escrowResponse.data.response : null;
-                const incomeDetails = escrow_detail?.income_details;
+                const incomeDetails = escrow_detail?.order_income;
                 
-                // *** CORREÇÃO ADICIONADA AQUI ***
-                // Cálculo das taxas e do frete com base nos dados de pagamento (escrow).
                 const txPlataforma = Math.abs(incomeDetails?.commission_fee || 0) + Math.abs(incomeDetails?.service_fee || 0);
-                const custoFrete = Math.abs(escrow_detail?.shipping_fee_info?.shipping_fee_seller_spend || 0);
+                const custoFrete = Math.abs(incomeDetails?.original_shipping_fee || escrow_detail?.shipping_fee_info?.shipping_fee_seller_spend || 0);
 
                 const valorTotalVenda = (order.item_list || []).reduce((sum, it) => (sum + (parseFloat(it.model_discounted_price || it.model_original_price || 0) * parseInt(it.model_quantity_purchased || 0, 10))), 0);
                 
@@ -403,10 +401,12 @@ async function getDetailsForChunk(uid, shopId, token, orderSnChunk) {
                     nomeProdutoVendido: order.item_list?.[0]?.item_name || '-', 
                     valorTotalVenda: valorTotalVenda, 
                     tracking_number: order.package_list?.[0]?.tracking_number || 'N/A',
-                    // *** CORREÇÃO ADICIONADA AQUI ***
-                    // Salvando os novos campos calculados.
                     txPlataforma: txPlataforma,
                     custoFrete: custoFrete,
+
+                    // *** CAMPOS PADRONIZADOS ADICIONADOS ***
+                    tipoAnuncio: 'Padrão',
+                    tipoEntrega: order.shipping_carrier || 'Não informado',
                 };
             } catch (escrowError) { 
                 console.warn(`[Shopee Escrow] Não foi possível buscar detalhes de pagamento para a venda ${order.order_sn}. Erro: ${escrowError.message}`);
