@@ -10,11 +10,16 @@ const CLIENT_SECRET = process.env.SHOPEE_CLIENT_SECRET || 'shpk6b594c72647159646
 const SHOPEE_BASE_URL = 'https://openplatform.shopee.com.br';
 const AXIOS_TIMEOUT = 30000;
 
+// Helper function to generate the HMAC-SHA256 signature for API calls
 function generateSign(path, partner_id, timestamp, access_token = '', shop_id = '') {
     const baseString = `${partner_id}${path}${timestamp}${access_token}${shop_id}`;
     return crypto.createHmac('sha256', CLIENT_SECRET).update(baseString).digest('hex');
 }
+
+// Helper function to introduce a delay
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// Helper function to split an array into smaller chunks
 function chunkArray(array, size) {
     const chunks = [];
     for (let i = 0; i < array.length; i += size) {
@@ -23,6 +28,7 @@ function chunkArray(array, size) {
     return chunks;
 }
 
+// Helper function to remove null or undefined properties from an object
 function cleanObject(obj) {
     const newObj = {};
     for (const key in obj) {
@@ -34,11 +40,12 @@ function cleanObject(obj) {
 }
 
 
+// Refreshes the Shopee access token if it's expired or close to expiring
 async function refreshTokenShopee(uid, shopId, accountData, forceRefresh = false) {
     try {
         if (!forceRefresh) {
             const lastRefresh = new Date(accountData.lastTokenRefresh || accountData.connectedAt).getTime();
-            const expireMs = (accountData.expire_in - 300) * 1000;
+            const expireMs = (accountData.expire_in - 300) * 1000; // Refresh 5 minutes before expiry
             if (Date.now() < lastRefresh + expireMs) {
                 return accountData.access_token;
             }
@@ -72,6 +79,8 @@ async function refreshTokenShopee(uid, shopId, accountData, forceRefresh = false
         throw error;
     }
 }
+
+// Gets a valid access token, refreshing it if necessary
 async function getValidTokenShopee(uid, shopId, forceRefresh = false) {
     const snap = await db.collection('users').doc(uid).collection('shopee').doc(shopId).get();
     if (!snap.exists) throw new Error(`Conta Shopee ${shopId} não encontrada.`);
@@ -80,10 +89,11 @@ async function getValidTokenShopee(uid, shopId, forceRefresh = false) {
     return await refreshTokenShopee(uid, shopId, data, forceRefresh);
 }
 
+// Route to initiate Shopee authentication
 router.get('/auth', (req, res) => {
     const { uid } = req.query;
     if (!uid) return res.status(400).send('UID do usuário é obrigatório.');
-    const backendUrl = NGROK.url || 'https://econtazoom-backend.onrender.com'; 
+    const backendUrl = NGROK.url || 'https://econtazoom-backend.onrender.com';
     const redirectUri = `${backendUrl}/shopee/callback?uid=${uid}`;
     const timestamp = Math.floor(Date.now() / 1000);
     const path = '/api/v2/shop/auth_partner';
@@ -95,6 +105,8 @@ router.get('/auth', (req, res) => {
     authUrl.searchParams.append('redirect', redirectUri);
     res.redirect(authUrl.toString());
 });
+
+// Callback route after Shopee authentication
 router.get('/callback', async (req, res) => {
     const { code, shop_id, uid } = req.query;
     if (!code || !shop_id || !uid) return res.status(400).send('Parâmetros de callback ausentes.');
@@ -116,6 +128,7 @@ router.get('/callback', async (req, res) => {
     } catch (error) { res.status(500).send(`Erro durante a autenticação: ${error.message}`); }
 });
 
+// Route to get all linked Shopee accounts for a user
 router.get('/contas', async (req, res) => {
     const { uid } = req.query;
     if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
@@ -125,6 +138,8 @@ router.get('/contas', async (req, res) => {
         res.json(contas);
     } catch (error) { res.status(500).json({ error: 'Erro ao buscar contas Shopee', detalhe: error.message }); }
 });
+
+// Route to fetch sales with pagination and filtering
 router.get('/vendas', async (req, res) => {
   const { uid, lastDocId, pageSize = 20, sortBy = 'create_time', sortOrder = 'desc', status, nomeConta } = req.query;
   if (!uid) return res.status(400).json({ error: 'UID do usuário é obrigatório.' });
@@ -143,11 +158,12 @@ router.get('/vendas', async (req, res) => {
     const snapshot = await queryRef.limit(pageSizeNum).get();
     const vendas = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
     const newLastDocId = snapshot.docs.length > 0 ? snapshot.docs[snapshot.docs.length - 1].id : null;
-    const hasMore = snapshot.docs.length === pageSizeNum; 
+    const hasMore = snapshot.docs.length === pageSizeNum;
     res.json({ vendas: vendas, pagination: { pageSize: pageSizeNum, lastDocId: newLastDocId, hasMore: hasMore } });
   } catch (error) { res.status(500).json({ error: `Erro no servidor: A consulta ao banco de dados falhou. Detalhes: ${error.message}` }); }
 });
 
+// Route to check for new updates for each account
 router.get('/check-updates', async (req, res) => {
     const { uid } = req.query;
     if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
@@ -157,21 +173,18 @@ router.get('/check-updates', async (req, res) => {
 
         const statusPromises = contasSnap.docs.map(async (doc) => {
             const conta = { id: doc.id, ...doc.data() };
-            const shopId = conta.id; 
+            const shopId = conta.id;
             const shopName = conta.shop_name;
-
-            // Lógica para determinar se é a primeira sincronização
             const isFirstSync = !conta.lastSyncTimestamp;
-            if (isFirstSync) {
-                return { id: shopId, nome: shopName, status: 'unsynced', newOrdersCount: 0 };
-            }
 
             try {
+                // Always check for orders, even on the first sync
                 const newOrders = await getAllOrderSnForShop(uid, shopId, conta.lastSyncTimestamp, Math.floor(Date.now() / 1000));
                 if (newOrders.length > 0) {
                     return { id: shopId, nome: shopName, status: 'needs_update', newOrdersCount: newOrders.length };
                 } else {
-                    return { id: shopId, nome: shopName, status: 'synced', newOrdersCount: 0 };
+                    // If no orders are found, the status depends on whether it was the initial sync
+                    return { id: shopId, nome: shopName, status: isFirstSync ? 'unsynced' : 'synced', newOrdersCount: 0 };
                 }
             } catch (error) {
                 return { id: shopId, nome: shopName, status: 'error', newOrdersCount: 0, error: error.message };
@@ -185,6 +198,7 @@ router.get('/check-updates', async (req, res) => {
 });
 
 
+// Route to trigger a sync for a single shop in the background
 router.post('/sync-single-shop', (req, res) => {
     const { uid, shopId } = req.body;
     if (!uid || !shopId) return res.status(400).json({ message: 'UID e shopId são obrigatórios.' });
@@ -195,18 +209,18 @@ router.post('/sync-single-shop', (req, res) => {
     });
 });
 
-// ALTERADO: Adicionado parâmetro 'salesProcessed' para um feedback mais claro
+// Updates the global sync status in Firestore for frontend feedback
 const updateSyncStatus = async (uid, message, progress = null, isError = false, shopName = '', salesProcessed = null) => {
     const statusRef = db.collection('users').doc(uid).collection('shopee').doc('sync_status');
     const statusUpdate = { message, lastUpdate: new Date().toISOString(), isError, shopName };
     if (progress !== null) statusUpdate.progress = progress;
-    // Adiciona a contagem de vendas processadas ao status, se fornecido
     if (salesProcessed !== null && !isNaN(salesProcessed)) {
         statusUpdate.salesProcessed = salesProcessed;
     }
     await statusRef.set(statusUpdate, { merge: true });
 };
 
+// Main synchronization logic
 async function runFullShopeeSync(uid, singleShopId = null) {
     let contas = [];
     if (singleShopId) {
@@ -230,8 +244,21 @@ async function runFullShopeeSync(uid, singleShopId = null) {
         const shopName = conta.shop_name || `Loja ${shopId}`;
         const shopRef = db.collection('users').doc(uid).collection('shopee').doc(shopId);
         
-        // ALTERADO: Lógica mais robusta para determinar a primeira sincronização
-        const lastSyncTimestamp = conta.lastSyncTimestamp || null;
+        let lastSyncTimestamp = conta.lastSyncTimestamp || null;
+        let isInitialSync = !lastSyncTimestamp;
+
+        // *** NEW: Auto-correction logic for stuck accounts ***
+        if (!isInitialSync) { // Only check if it thinks it has synced before
+            const vendasQuery = await db.collection('users').doc(uid).collection('shopeeVendas').where('shop_id', '==', shopId).limit(1).get();
+            if (vendasQuery.empty) {
+                // This account has a sync timestamp but no sales recorded. It's a stuck account.
+                // Force a full initial sync by ignoring the old timestamp.
+                console.log(`[Shopee Sync] Conta ${shopName} (${shopId}) está presa. Forçando re-sincronização completa.`);
+                isInitialSync = true;
+                lastSyncTimestamp = null; // Ensure we use the initial sync logic
+            }
+        }
+        // *** END of new logic ***
 
         try {
             const syncExecutionTime = Math.floor(Date.now() / 1000);
@@ -239,13 +266,18 @@ async function runFullShopeeSync(uid, singleShopId = null) {
             
             const orderSnList = await getAllOrderSnForShop(uid, shopId, lastSyncTimestamp, syncExecutionTime);
             
-            // CORREÇÃO: Atualiza o timestamp mesmo que não haja novas vendas. Essencial para a primeira sincronização.
             if (orderSnList.length === 0) {
-                 await shopRef.update({ lastSyncTimestamp: syncExecutionTime });
-                 // Informa que 0 vendas foram processadas
-                 await updateSyncStatus(uid, `Nenhuma venda nova ou atualização encontrada.`, 100, false, shopName, 0);
+                 const message = isInitialSync
+                    ? 'Nenhuma venda encontrada nos últimos 90 dias.'
+                    : 'Nenhuma venda nova ou atualização encontrada.';
+                
+                 if (!isInitialSync) {
+                    await shopRef.update({ lastSyncTimestamp: syncExecutionTime });
+                 }
+
+                 await updateSyncStatus(uid, message, 100, false, shopName, 0);
                  await delay(1500);
-                 continue; 
+                 continue;
             }
 
             await updateSyncStatus(uid, `Buscando ${orderSnList.length} vendas...`, 20, false, shopName);
@@ -257,7 +289,7 @@ async function runFullShopeeSync(uid, singleShopId = null) {
             await updateSyncStatus(uid, `Salvando ${salesAddedCount} vendas...`, 95, false, shopName);
             
             if (salesAddedCount > 0) {
-                const firestoreBatchChunks = chunkArray(allVendasComDetalhes, 400); 
+                const firestoreBatchChunks = chunkArray(allVendasComDetalhes, 400);
                 for (const batchChunk of firestoreBatchChunks) {
                     const batch = db.batch();
                     for (const venda of batchChunk) {
@@ -273,7 +305,6 @@ async function runFullShopeeSync(uid, singleShopId = null) {
 
             await shopRef.update({ lastSyncTimestamp: syncExecutionTime });
 
-            // ALTERADO: Adiciona a contagem de vendas ao status de sucesso
             await updateSyncStatus(uid, `Sincronização concluída!`, 100, false, shopName, salesAddedCount);
             await delay(1500);
         } catch (error) {
@@ -286,17 +317,17 @@ async function runFullShopeeSync(uid, singleShopId = null) {
     await updateSyncStatus(uid, `Processo finalizado.`, 100, false, 'Sistema');
 }
 
-// ALTERADO: Lógica de busca de pedidos refatorada para maior clareza
+// Fetches all order serial numbers for a given shop and time range
 async function getAllOrderSnForShop(uid, shopId, lastSyncTimestamp, syncExecutionTime) {
     const allOrderSn = new Set();
     const path = '/api/v2/order/get_order_list';
     const isInitialSync = !lastSyncTimestamp;
     
     if (isInitialSync) {
-        // Primeira sincronização: busca os últimos 90 dias de pedidos CRIADOS
+        // For the first sync, look back 90 days by create_time in 15-day chunks
         const time_range_field = 'create_time';
         const totalLookbackDays = 90;
-        const initialSyncStartTime = syncExecutionTime; 
+        const initialSyncStartTime = syncExecutionTime;
         for (let i = 0; i < totalLookbackDays / 15; i++) {
             const time_to = initialSyncStartTime - (i * 15 * 24 * 60 * 60);
             const time_from = time_to - (15 * 24 * 60 * 60);
@@ -304,16 +335,16 @@ async function getAllOrderSnForShop(uid, shopId, lastSyncTimestamp, syncExecutio
             await fetchOrderListChunk(uid, shopId, path, time_from, time_to, time_range_field, allOrderSn);
         }
     } else {
-        // Sincronizações seguintes: busca pedidos ATUALIZADOS desde a última vez
+        // For subsequent syncs, use update_time
         const time_range_field = 'update_time';
-        // Busca 10 minutos extras para evitar perder pedidos por diferenças de relógio
-        const time_from = lastSyncTimestamp - (60 * 10);
+        const time_from = lastSyncTimestamp - (60 * 10); // 10-minute overlap
         await fetchOrderListChunk(uid, shopId, path, time_from, syncExecutionTime, time_range_field, allOrderSn);
     }
     
     return Array.from(allOrderSn);
 }
 
+// Fetches a single page (chunk) of orders from the Shopee API
 async function fetchOrderListChunk(uid, shopId, path, time_from, time_to, time_range_field, allOrderSn) {
     let token = await getValidTokenShopee(uid, shopId);
     let cursor = "";
@@ -321,17 +352,17 @@ async function fetchOrderListChunk(uid, shopId, path, time_from, time_to, time_r
     do {
         const timestamp = Math.floor(Date.now() / 1000);
         const sign = generateSign(path, CLIENT_ID, timestamp, token, shopId);
-        const params = { 
-            partner_id: parseInt(CLIENT_ID), 
-            shop_id: parseInt(shopId), 
-            timestamp, 
-            access_token: token, 
-            sign, 
-            time_range_field, 
-            time_from: Math.floor(time_from), 
-            time_to: Math.floor(time_to), 
-            page_size: 100, 
-            cursor 
+        const params = {
+            partner_id: parseInt(CLIENT_ID),
+            shop_id: parseInt(shopId),
+            timestamp,
+            access_token: token,
+            sign,
+            time_range_field,
+            time_from: Math.floor(time_from),
+            time_to: Math.floor(time_to),
+            page_size: 100,
+            cursor
         };
         
         const response = await axios.get(`${SHOPEE_BASE_URL}${path}`, { params, timeout: AXIOS_TIMEOUT });
@@ -346,25 +377,26 @@ async function fetchOrderListChunk(uid, shopId, path, time_from, time_to, time_r
         cursor = response.data.response?.next_cursor || "";
 
         if (cursor) {
-           await delay(333);
+           await delay(333); // Small delay to avoid hitting rate limits
         }
     } while (cursor);
 }
 
 
+// Fetches detailed information for a chunk of orders
 async function getDetailsForChunk(uid, shopId, token, orderSnChunk) {
     try {
         const pathDetail = '/api/v2/order/get_order_detail';
         const timestamp = Math.floor(Date.now() / 1000);
         const sign = generateSign(pathDetail, CLIENT_ID, timestamp, token, shopId);
-        const params = { 
-            partner_id: parseInt(CLIENT_ID), 
-            shop_id: parseInt(shopId), 
-            timestamp, 
-            access_token: token, 
-            sign, 
-            order_sn_list: orderSnChunk.join(','), 
-            response_optional_fields: 'buyer_user_id,buyer_username,recipient_address,item_list,payment_method,shipping_carrier,package_list,order_status' 
+        const params = {
+            partner_id: parseInt(CLIENT_ID),
+            shop_id: parseInt(shopId),
+            timestamp,
+            access_token: token,
+            sign,
+            order_sn_list: orderSnChunk.join(','),
+            response_optional_fields: 'buyer_user_id,buyer_username,recipient_address,item_list,payment_method,shipping_carrier,package_list,order_status'
         };
 
         const response = await axios.get(`${SHOPEE_BASE_URL}${pathDetail}`, { params, timeout: AXIOS_TIMEOUT });
@@ -385,50 +417,61 @@ async function getDetailsForChunk(uid, shopId, token, orderSnChunk) {
                 const escrowResponse = await axios.get(`${SHOPEE_BASE_URL}${escrowPath}`, { params: { partner_id: parseInt(CLIENT_ID), shop_id: parseInt(shopId), order_sn: order.order_sn, sign: escrowSign, timestamp: escrowTimestamp, access_token: token }, timeout: AXIOS_TIMEOUT });
                 
                 const escrow_detail = (!escrowResponse.data.error && escrowResponse.data.response) ? escrowResponse.data.response : null;
-                const incomeDetails = escrow_detail?.order_income;
+                const incomeDetails = escrow_detail?.order_income || {};
                 
-                const txPlataforma = Math.abs(incomeDetails?.commission_fee || 0) + Math.abs(incomeDetails?.service_fee || 0);
-                const custoFrete = Math.abs(incomeDetails?.original_shipping_fee || escrow_detail?.shipping_fee_info?.shipping_fee_seller_spend || 0);
-
+                const txPlataforma = Math.abs(incomeDetails.commission_fee || 0) + Math.abs(incomeDetails.service_fee || 0);
+                const custoFrete = Math.abs(escrow_detail?.shipping_fee_info?.shipping_fee_seller_spend || incomeDetails.original_shipping_fee || 0);
                 const valorTotalVenda = (order.item_list || []).reduce((sum, it) => (sum + (parseFloat(it.model_discounted_price || it.model_original_price || 0) * parseInt(it.model_quantity_purchased || 0, 10))), 0);
                 
-                return { 
-                    order_sn: order.order_sn, 
-                    order_status: order.order_status || 'UNKNOWN', 
-                    create_time: order.create_time || 0, 
-                    update_time: order.update_time || 0, 
-                    item_list: order.item_list || [], 
-                    package_list: order.package_list || [], 
-                    payment_method: order.payment_method || 'UNKNOWN', 
-                    shipping_carrier: order.shipping_carrier || 'UNKNOWN', 
-                    recipient_address: order.recipient_address || {}, 
-                    buyer_username: order.buyer_username || null, 
-                    escrow_detail: escrow_detail, 
-                    status: (order.order_status || 'UNKNOWN').toUpperCase(), 
-                    idVendaMarketplace: order.order_sn, 
-                    canalVenda: 'Shopee', 
+                return {
+                    order_sn: order.order_sn,
+                    order_status: order.order_status || 'UNKNOWN',
+                    create_time: order.create_time || 0,
+                    update_time: order.update_time || 0,
+                    item_list: order.item_list || [],
+                    package_list: order.package_list || [],
+                    payment_method: order.payment_method || 'UNKNOWN',
+                    shipping_carrier: order.shipping_carrier || 'UNKNOWN',
+                    recipient_address: order.recipient_address || {},
+                    buyer_username: order.buyer_username || null,
+                    escrow_detail: escrow_detail,
+                    status: (order.order_status || 'UNKNOWN').toUpperCase(),
+                    idVendaMarketplace: order.order_sn,
+                    canalVenda: 'Shopee',
                     shop_id: shopId,
-                    dataHora: new Date((order.create_time || 0) * 1000).toISOString(), 
-                    cliente: order.recipient_address?.name || order.buyer_username || 'Desconhecido', 
-                    nomeProdutoVendido: order.item_list?.[0]?.item_name || '-', 
-                    valorTotalVenda: valorTotalVenda, 
+                    dataHora: new Date((order.create_time || 0) * 1000).toISOString(),
+                    cliente: order.recipient_address?.name || order.buyer_username || 'Desconhecido',
+                    nomeProdutoVendido: order.item_list?.[0]?.item_name || '-',
+                    valorTotalVenda: valorTotalVenda,
                     tracking_number: order.package_list?.[0]?.tracking_number || 'N/A',
                     txPlataforma: txPlataforma,
                     custoFrete: custoFrete,
                     tipoAnuncio: 'Padrão',
                     tipoEntrega: order.shipping_carrier || 'Não informado',
                 };
-            } catch (escrowError) { 
+            } catch (escrowError) {
                 console.warn(`[Shopee Escrow] Não foi possível buscar detalhes de pagamento para a venda ${order.order_sn}. Erro: ${escrowError.message}`);
-                return { ...order, escrow_detail: null };
+                const valorTotalVenda = (order.item_list || []).reduce((sum, it) => (sum + (parseFloat(it.model_discounted_price || it.model_original_price || 0) * parseInt(it.model_quantity_purchased || 0, 10))), 0);
+                return {
+                    ...order,
+                    escrow_detail: null,
+                    txPlataforma: 0,
+                    custoFrete: 0,
+                    valorTotalVenda: valorTotalVenda,
+                    canalVenda: 'Shopee',
+                    shop_id: shopId,
+                    dataHora: new Date((order.create_time || 0) * 1000).toISOString(),
+                 };
             }
         });
         return await Promise.all(promises);
-    } catch (error) { 
+    } catch (error) {
         console.error(`[Shopee Detail] Erro crítico ao buscar detalhes do chunk:`, error);
         return [];
     }
 }
+
+// Fetches order details in parallel batches for efficiency
 async function getOrderDetailsInParallel(uid, shopId, orderSnList, onProgress) {
     const token = await getValidTokenShopee(uid, shopId);
     const detailChunks = chunkArray(orderSnList, 50);

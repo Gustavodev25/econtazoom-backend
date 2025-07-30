@@ -196,19 +196,16 @@ router.get('/vendas-paginadas', async (req, res) => {
   } catch (error) { res.status(500).json({ error: `Erro no servidor: ${error.message}` }); }
 });
 
-// ALTERADO: Adicionado parâmetro 'salesProcessed' para um feedback mais claro
 const updateSyncStatus = async (uid, message, progress = null, isError = false, accountName = '', salesProcessed = null) => {
     const statusRef = db.collection('users').doc(uid).collection('mercadoLivre').doc('sync_status');
     const statusUpdate = { message, lastUpdate: new Date().toISOString(), isError, accountName };
     if (progress !== null) statusUpdate.progress = progress;
-    // Adiciona a contagem de vendas processadas ao status, se fornecido
     if (salesProcessed !== null && !isNaN(salesProcessed)) {
         statusUpdate.salesProcessed = salesProcessed;
     }
     await statusRef.set(statusUpdate, { merge: true });
 };
 
-// ALTERADO: Lógica de verificação de atualizações simplificada
 router.get('/check-updates', async (req, res) => {
     const { uid } = req.query;
     if (!uid) return res.status(400).json({ error: 'UID obrigatório' });
@@ -221,13 +218,11 @@ router.get('/check-updates', async (req, res) => {
             const accountId = conta.id;
             const accountName = conta.nickname;
 
-            // Se não houver 'lastSyncTimestamp', a conta nunca foi sincronizada.
             if (!conta.lastSyncTimestamp) {
                 return { id: accountId, nome: accountName, status: 'unsynced', newOrdersCount: 0 };
             }
 
             try {
-                // Busca apenas por pedidos atualizados desde a última sincronização.
                 const updatedOrderIds = await getUpdatedOrderIds(uid, accountId, conta.lastSyncTimestamp);
                 if (updatedOrderIds.length > 0) {
                     return { id: accountId, nome: accountName, status: 'needs_update', newOrdersCount: updatedOrderIds.length };
@@ -256,7 +251,6 @@ router.post('/sync-single-shop', (req, res) => {
     });
 });
 
-// ALTERADO: Lógica de sincronização principal refatorada para maior clareza e robustez
 async function runFullMercadoLivreSync(uid, singleAccountId) {
     const contaRef = db.collection('users').doc(uid).collection('mercadoLivre').doc(singleAccountId);
     let accountName = `Conta ${singleAccountId}`;
@@ -429,11 +423,63 @@ async function processSingleOrderDetail(token, orderDetails) {
             const shipmentRes = await fetch(`https://api.mercadolibre.com/shipments/${orderDetails.shipping.id}`, { headers: { Authorization: `Bearer ${token}` } });
             if (shipmentRes.ok) shipmentDetails = await shipmentRes.json();
         }
+        
+        // --- INÍCIO DA NOVA LÓGICA DE FRETE (TRADUZIDA DO SQL) ---
+        const calcularFreteAjustado = (order, shipment) => {
+            // Função auxiliar para garantir que os valores sejam numéricos
+            const num = (val) => Number(val || 0);
 
-        const shippingCost = calcularFreteAdjust(orderDetails, shipmentDetails);
-        const orderItems = Array.isArray(orderDetails.order_items) ? orderDetails.order_items : [];
-        const saleFee = orderItems.reduce((acc, item) => acc + (item.sale_fee || 0), 0);
+            // Extração dos dados necessários do pedido e do envio
+            const logisticType = shipment?.logistic_type;
+            const orderCost = num(order?.total_amount);
+            const quantity = (order?.order_items || []).reduce((acc, item) => acc + num(item.quantity), 0);
+            
+            // Dados extraídos do objeto 'shipment'
+            const baseCost = num(shipment?.base_cost);      // SQL: base_cost
+            const listCost = num(shipment?.list_cost);      // SQL: shipment_list_cost
+            
+            // Custo do frete do pedido
+            const shippingCost = num(order?.shipping?.cost); // SQL: shipment_cost
+
+            // Evita divisão por zero para calcular o preço por item
+            const pricePerItem = quantity > 0 ? orderCost / quantity : 0;
+
+            let freteFinal = 0;
+
+            // Lógica principal baseada no preço por item
+            if (pricePerItem < 79) {
+                if (logisticType === 'self_service') {
+                    freteFinal = baseCost;
+                } else {
+                    freteFinal = 0;
+                }
+            } else { // se pricePerItem >= 79
+                const logisticTypesPrincipais = ['drop_off', 'xd_drop_off', 'fulfillment', 'cross_docking'];
+                if (logisticType === 'self_service') {
+                    freteFinal = baseCost - listCost;
+                } else if (logisticTypesPrincipais.includes(logisticType)) {
+                    freteFinal = listCost - shippingCost;
+                } else {
+                    freteFinal = 999; // Valor de fallback para casos não mapeados, conforme SQL
+                }
+            }
+
+            // Aplicação do multiplicador final
+            const multiplier = logisticType === 'self_service' ? 1 : -1;
+            freteFinal *= multiplier;
+
+            return freteFinal;
+        };
+
+        const custoFreteAjustado = calcularFreteAjustado(orderDetails, shipmentDetails);
+        // --- FIM DA NOVA LÓGICA DE FRETE ---
+        
+        // A taxa da plataforma (comissão) é a soma da 'sale_fee' de cada item.
+        const saleFee = (orderDetails.order_items || []).reduce((acc, item) => acc + (item.sale_fee || 0), 0);
+        
         const cliente = orderDetails.buyer?.nickname || `${orderDetails.buyer?.first_name || ''} ${orderDetails.buyer?.last_name || ''}`.trim() || 'Desconhecido';
+
+        const orderItems = Array.isArray(orderDetails.order_items) ? orderDetails.order_items : [];
 
         return {
             id: orderDetails.id?.toString(),
@@ -447,7 +493,7 @@ async function processSingleOrderDetail(token, orderDetails) {
             nomeProdutoVendido: orderItems[0]?.item?.title || '-',
             valorTotalVenda: Number(orderDetails.total_amount || 0),
             txPlataforma: saleFee,
-            custoFrete: shippingCost,
+            custoFrete: custoFreteAjustado, // Usando o novo valor de frete calculado
             tipoAnuncio: orderItems[0]?.listing_type_id || 'Não informado',
             tipoEntrega: shipmentDetails.shipping_option?.name || shipmentDetails.logistic_type || 'Não informado',
             seller: { id: orderDetails.seller?.id, nickname: orderDetails.seller?.nickname },
@@ -461,11 +507,18 @@ async function processSingleOrderDetail(token, orderDetails) {
             buyer: { id: orderDetails.buyer?.id, nickname: orderDetails.buyer?.nickname, first_name: orderDetails.buyer?.first_name, last_name: orderDetails.buyer?.last_name },
             shipping: { id: orderDetails.shipping?.id, status: orderDetails.shipping?.status, logistic_type: orderDetails.shipping?.logistic_type },
             shipping_details: {
-                id: shipmentDetails.id, status: shipmentDetails.status, logistic_type: shipmentDetails.logistic_type, shipping_option: shipmentDetails.shipping_option,
+                id: shipmentDetails.id,
+                status: shipmentDetails.status,
+                logistic_type: shipmentDetails.logistic_type,
+                shipping_option: shipmentDetails.shipping_option,
                 tracking_number: shipmentDetails.tracking_number,
+                base_cost: shipmentDetails.base_cost, // Adicionado para referência
+                list_cost: shipmentDetails.list_cost, // Adicionado para referência
                 receiver_address: {
-                    address_line: shipmentDetails.receiver_address?.address_line, city: shipmentDetails.receiver_address?.city?.name,
-                    state: shipmentDetails.receiver_address?.state?.name, zip_code: shipmentDetails.receiver_address?.zip_code,
+                    address_line: shipmentDetails.receiver_address?.address_line,
+                    city: shipmentDetails.receiver_address?.city?.name,
+                    state: shipmentDetails.receiver_address?.state?.name,
+                    zip_code: shipmentDetails.receiver_address?.zip_code,
                 }
             }
         };
@@ -473,24 +526,6 @@ async function processSingleOrderDetail(token, orderDetails) {
         console.warn(`[ML Process] Erro ao processar venda ${orderDetails.id}: ${error.message}`);
         return null;
     }
-}
-
-function calcularFreteAdjust(orderDetails, shippingDetails) {
-    const logisticType = shippingDetails?.logistic_type;
-    const shippingOption = shippingDetails?.shipping_option;
-    const unitPrice = Number(orderDetails.order_items?.[0]?.unit_price || 0);
-    const listCost = Number(shippingOption?.list_cost || 0);
-    const buyerCost = Number(shippingOption?.cost || 0);
-    const baseCost = Number(shippingOption?.base_cost || 0);
-    let finalCost = 0;
-
-    switch (logisticType) {
-        case 'self_service': finalCost = (unitPrice < 79) ? baseCost : (baseCost - listCost); break;
-        case 'drop_off': case 'xd_drop_off': finalCost = Math.max(0, listCost - buyerCost); break;
-        case 'fulfillment': case 'cross_docking': finalCost = Math.max(0, listCost); break;
-        default: finalCost = 0; break;
-    }
-    return parseFloat(finalCost.toFixed(2));
 }
 
 module.exports = router;
