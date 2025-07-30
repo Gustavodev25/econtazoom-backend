@@ -72,7 +72,12 @@ router.get('/auth', (req, res) => {
     if (!uid) return res.status(400).send('UID do usuário é obrigatório.');
     const backendUrl = NGROK.url || 'https://econtazoom-backend.onrender.com';
     const redirectUri = `${backendUrl}/ml/callback`;
-    const authUrl = new URL('https://auth.mercadolibre.com.br/authorization');
+    
+    // *** CORREÇÃO APLICADA AQUI ***
+    // Alterado o URL de 'auth.mercadolibre.com.br' para 'auth.mercadolibre.com'
+    // para usar o domínio global e evitar possíveis problemas de DNS.
+    const authUrl = new URL('https://auth.mercadolibre.com/authorization');
+
     authUrl.searchParams.append('response_type', 'code');
     authUrl.searchParams.append('client_id', CLIENT_ID);
     authUrl.searchParams.append('redirect_uri', redirectUri);
