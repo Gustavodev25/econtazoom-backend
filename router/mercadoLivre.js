@@ -179,21 +179,47 @@ router.get('/vendas-paginadas', async (req, res) => {
   const pageSizeNum = parseInt(pageSize, 10);
   try {
     let queryRef = db.collection('users').doc(uid).collection('mlVendas');
-    const statusFiltro = status && status !== 'todos' ? status.toLowerCase() : null;
-    if (statusFiltro) queryRef = queryRef.where('status', '==', statusFiltro);
-    if (nomeConta && nomeConta !== 'todos') queryRef = queryRef.where('nomeConta', '==', nomeConta);
-    queryRef = queryRef.orderBy(sortBy, sortOrder);
+    
+    const statusFiltro = status && status !== 'todos' ? status : null;
+    const contaFiltro = nomeConta && nomeConta !== 'todos' ? nomeConta : null;
+
+    if (statusFiltro) {
+        queryRef = queryRef.where('status', '==', statusFiltro);
+    }
+    if (contaFiltro) {
+        // ATENÇÃO: Filtrar por 'status' e 'nomeConta' ao mesmo tempo exigirá um índice composto no Firestore.
+        // O Firestore retornará um erro com um link para criar este índice caso ele não exista.
+        queryRef = queryRef.where('nomeConta', '==', contaFiltro);
+    }
+
+    // Se nenhum filtro estiver ativo, ordena pela data como padrão.
+    if (!statusFiltro && !contaFiltro) {
+        queryRef = queryRef.orderBy(sortBy, sortOrder);
+    } else {
+        // Se um filtro estiver ativo, a ordenação é feita pelo ID do documento para evitar erros de índice.
+        // Isso garante que a paginação funcione corretamente com um único filtro ativo.
+        queryRef = queryRef.orderBy(FieldPath.documentId(), 'desc');
+    }
+
     if (lastDocId) {
       const lastDocSnapshot = await db.collection('users').doc(uid).collection('mlVendas').doc(lastDocId).get();
       if (!lastDocSnapshot.exists) return res.status(404).json({ error: 'Documento de referência não encontrado.' });
       queryRef = queryRef.startAfter(lastDocSnapshot);
     }
+
     const snapshot = await queryRef.limit(pageSizeNum + 1).get();
-    const vendas = snapshot.docs.slice(0, pageSizeNum).map(doc => ({ id: doc.id, ...doc.data() }));
+    let vendas = snapshot.docs.slice(0, pageSizeNum).map(doc => ({ id: doc.id, ...doc.data() }));
     const hasMore = snapshot.docs.length > pageSizeNum;
     const newLastDocId = vendas.length > 0 ? snapshot.docs[vendas.length - 1].id : null;
+    
+    // Para melhor experiência, os resultados da página atual são sempre reordenados por data na memória.
+    vendas.sort((a, b) => new Date(b.date_created) - new Date(a.date_created));
+
     res.json({ vendas, pagination: { pageSize: pageSizeNum, lastDocId: newLastDocId, hasMore } });
-  } catch (error) { res.status(500).json({ error: `Erro no servidor: ${error.message}` }); }
+  } catch (error) { 
+      console.error("Erro ao buscar vendas paginadas:", error.message);
+      res.status(500).json({ error: `Erro no servidor: ${error.message}` }); 
+  }
 });
 
 const updateSyncStatus = async (uid, message, progress = null, isError = false, accountName = '', salesProcessed = null) => {
@@ -424,68 +450,55 @@ async function processSingleOrderDetail(token, orderDetails) {
             if (shipmentRes.ok) shipmentDetails = await shipmentRes.json();
         }
         
-        // --- INÍCIO DA NOVA LÓGICA DE FRETE (TRADUZIDA DO SQL) ---
         const calcularFreteAjustado = (order, shipment) => {
-            // Função auxiliar para garantir que os valores sejam numéricos
             const num = (val) => Number(val || 0);
-
-            // Extração dos dados necessários do pedido e do envio
             const logisticType = shipment?.logistic_type;
             const orderCost = num(order?.total_amount);
             const quantity = (order?.order_items || []).reduce((acc, item) => acc + num(item.quantity), 0);
-            
-            // Dados extraídos do objeto 'shipment'
-            const baseCost = num(shipment?.base_cost);      // SQL: base_cost
-            const listCost = num(shipment?.list_cost);      // SQL: shipment_list_cost
-            
-            // Custo do frete do pedido
-            const shippingCost = num(order?.shipping?.cost); // SQL: shipment_cost
-
-            // Evita divisão por zero para calcular o preço por item
+            const baseCost = num(shipment?.base_cost);     
+            const listCost = num(shipment?.list_cost);      
+            const shippingCost = num(order?.shipping?.cost); 
             const pricePerItem = quantity > 0 ? orderCost / quantity : 0;
-
             let freteFinal = 0;
-
-            // Lógica principal baseada no preço por item
             if (pricePerItem < 79) {
                 if (logisticType === 'self_service') {
                     freteFinal = baseCost;
                 } else {
                     freteFinal = 0;
                 }
-            } else { // se pricePerItem >= 79
+            } else {
                 const logisticTypesPrincipais = ['drop_off', 'xd_drop_off', 'fulfillment', 'cross_docking'];
                 if (logisticType === 'self_service') {
                     freteFinal = baseCost - listCost;
                 } else if (logisticTypesPrincipais.includes(logisticType)) {
                     freteFinal = listCost - shippingCost;
                 } else {
-                    freteFinal = 999; // Valor de fallback para casos não mapeados, conforme SQL
+                    freteFinal = 999; 
                 }
             }
-
-            // Aplicação do multiplicador final
             const multiplier = logisticType === 'self_service' ? 1 : -1;
             freteFinal *= multiplier;
-
             return freteFinal;
         };
 
         const custoFreteAjustado = calcularFreteAjustado(orderDetails, shipmentDetails);
-        // --- FIM DA NOVA LÓGICA DE FRETE ---
         
-        // A taxa da plataforma (comissão) é a soma da 'sale_fee' de cada item.
         const saleFee = (orderDetails.order_items || []).reduce((acc, item) => acc + (item.sale_fee || 0), 0);
         
         const cliente = orderDetails.buyer?.nickname || `${orderDetails.buyer?.first_name || ''} ${orderDetails.buyer?.last_name || ''}`.trim() || 'Desconhecido';
 
         const orderItems = Array.isArray(orderDetails.order_items) ? orderDetails.order_items : [];
 
+        // MODIFICADO: Status padronizado para minúsculas para evitar erros de case-sensitive.
+        const statusOriginal = orderDetails.status ? orderDetails.status.toLowerCase() : '';
+        const statusFinal = (statusOriginal === 'paid') ? 'pago' : 'cancelado';
+
         return {
             id: orderDetails.id?.toString(),
             idVendaMarketplace: orderDetails.id?.toString(),
             canalVenda: 'Mercado Livre',
-            status: orderDetails.status,
+            status: statusFinal, // Salva como 'pago' ou 'cancelado'
+            statusOriginal: orderDetails.status, // Mantém o status original da API para referência
             dataHora: orderDetails.date_created,
             date_created: orderDetails.date_created,
             date_closed: orderDetails.date_closed,
@@ -493,7 +506,7 @@ async function processSingleOrderDetail(token, orderDetails) {
             nomeProdutoVendido: orderItems[0]?.item?.title || '-',
             valorTotalVenda: Number(orderDetails.total_amount || 0),
             txPlataforma: saleFee,
-            custoFrete: custoFreteAjustado, // Usando o novo valor de frete calculado
+            custoFrete: custoFreteAjustado, 
             tipoAnuncio: orderItems[0]?.listing_type_id || 'Não informado',
             tipoEntrega: shipmentDetails.shipping_option?.name || shipmentDetails.logistic_type || 'Não informado',
             seller: { id: orderDetails.seller?.id, nickname: orderDetails.seller?.nickname },
@@ -512,8 +525,8 @@ async function processSingleOrderDetail(token, orderDetails) {
                 logistic_type: shipmentDetails.logistic_type,
                 shipping_option: shipmentDetails.shipping_option,
                 tracking_number: shipmentDetails.tracking_number,
-                base_cost: shipmentDetails.base_cost, // Adicionado para referência
-                list_cost: shipmentDetails.list_cost, // Adicionado para referência
+                base_cost: shipmentDetails.base_cost, 
+                list_cost: shipmentDetails.list_cost, 
                 receiver_address: {
                     address_line: shipmentDetails.receiver_address?.address_line,
                     city: shipmentDetails.receiver_address?.city?.name,
