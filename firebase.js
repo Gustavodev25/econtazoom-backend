@@ -9,7 +9,7 @@ if (process.env.FIREBASE_CONFIG) {
     });
   }
 } else {
-  const serviceAccount = require('./econtazoom-9c5d8-firebase-adminsdk-fbsvc-22c535a590.json');
+  const serviceAccount = require('./econtazoom-9c5d8-firebase-adminsdk-fbsvc-37ff7302c1.json');
   if (!admin.apps.length) {
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount)
