@@ -67,10 +67,13 @@ async function getValidTokenML(uid, contaId) {
 }
 
 router.get('/auth', (req, res) => {
-    const { uid } = req.query;
+    // MODIFICADO: Lê 'redirectUrl' da query string.
+    const { uid, redirectUrl } = req.query;
     if (!uid) return res.status(400).send('UID do usuário é obrigatório.');
 
-    const finalRedirectUrl = req.headers.referer || 'http://localhost:8080/contas'; 
+    // MODIFICADO: Usa a URL de redirecionamento da query se existir, senão usa o referer como fallback.
+    const finalRedirectUrl = redirectUrl ? decodeURIComponent(redirectUrl) : (req.headers.referer || 'http://localhost:8080/contas'); 
+    
     const state = {
         uid: uid,
         finalRedirectUrl: finalRedirectUrl
@@ -249,9 +252,15 @@ router.get('/check-updates', async (req, res) => {
             }
 
             try {
+                // Busca IDs de vendas atualizadas
                 const updatedOrderIds = await getUpdatedOrderIds(uid, accountId, conta.lastSyncTimestamp);
-                if (updatedOrderIds.length > 0) {
-                    return { id: accountId, nome: accountName, status: 'needs_update', newOrdersCount: updatedOrderIds.length };
+                // Busca IDs já salvos no Firestore
+                const vendasSnap = await db.collection('users').doc(uid).collection('mlVendas').where('nomeConta', '==', accountName).get();
+                const vendasSalvasIds = new Set(vendasSnap.docs.map(doc => doc.id));
+                // Filtra apenas IDs que ainda não estão salvos
+                const newOrderIds = updatedOrderIds.filter(id => !vendasSalvasIds.has(id.toString()));
+                if (newOrderIds.length > 0) {
+                    return { id: accountId, nome: accountName, status: 'needs_update', newOrdersCount: newOrderIds.length };
                 } else {
                     return { id: accountId, nome: accountName, status: 'synced', newOrdersCount: 0 };
                 }
